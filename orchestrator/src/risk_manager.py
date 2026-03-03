@@ -117,8 +117,15 @@ class RiskManager:
                 )
 
         # 3. Validate each model action
+        # Skip LLM sells for symbols already covered by forced stop-losses
+        forced_sell_symbols = {a.symbol for a in result.forced_actions if a.type == "SELL"}
         validated = []
         for action in decision.actions:
+            if action.type == "SELL" and action.symbol in forced_sell_symbols:
+                result.modifications.append(
+                    f"SKIPPED {action.type} {action.symbol}: already covered by forced stop-loss"
+                )
+                continue
             check = self._validate_action(action, portfolio, quotes, order_history)
             if check.approved:
                 validated.append(check)
