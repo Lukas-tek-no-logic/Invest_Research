@@ -146,6 +146,8 @@ class OptionsRiskManager:
         )
         cash_available = cash   # we will decrement as we approve CSPs
         md = market_data or {}
+        # Track symbols already approved this cycle to prevent LLM from opening same symbol twice
+        approved_csp_symbols = {p.symbol for p in open_csps if p.id not in closing_ids}
 
         for action in decision.actions:
             if action.type != "SELL_CSP":
@@ -153,6 +155,13 @@ class OptionsRiskManager:
 
             symbol = action.symbol
             contracts = max(1, action.contracts)
+
+            # 0. Duplicate check within this cycle
+            if symbol in approved_csp_symbols:
+                reason = f"CSP for {symbol} already open or approved this cycle — skipped"
+                result.rejected_opens.append({"instruction": action, "reason": reason})
+                result.modifications.append(f"[REJECTED CSP] {symbol}: {reason}")
+                continue
 
             # 1. Max open CSPs
             if current_csp_count >= self.max_open_csps:
@@ -171,6 +180,18 @@ class OptionsRiskManager:
             estimated_assignment = _estimate_assignment_cost(
                 action, portfolio, account_value, md.get(symbol, {})
             )
+
+            # Hard check: collateral must fit in available cash
+            if estimated_assignment > cash_available:
+                reason = (
+                    f"Collateral required (≈${estimated_assignment:,.0f}) exceeds "
+                    f"available cash (${cash_available:,.0f}) for {symbol} CSP "
+                    f"({contracts} contract{'s' if contracts > 1 else ''})"
+                )
+                result.rejected_opens.append({"instruction": action, "reason": reason})
+                result.modifications.append(f"[REJECTED CSP] {symbol}: {reason}")
+                continue
+
             cash_after = cash_available - estimated_assignment
             cash_after_pct = cash_after / account_value * 100
             if cash_after_pct < self.min_cash_pct:
@@ -192,6 +213,7 @@ class OptionsRiskManager:
 
             # Approved
             result.approved_opens.append(action)
+            approved_csp_symbols.add(symbol)
             current_csp_count += 1
             cash_available -= estimated_assignment
 
@@ -290,7 +312,7 @@ def _estimate_assignment_cost(
     Priority:
       1. LLM-supplied strike hint (most accurate)
       2. Current market price × 100 (conservative — actual OTM strike will be slightly less)
-      3. Fallback: 50% of account value (forces rejection for unknown symbols)
+      3. Fallback: 2× account value (forces rejection — never approve when price is unknown)
     """
     contracts = max(1, action.contracts)
     if action.strike and action.strike > 0:
@@ -300,8 +322,9 @@ def _estimate_assignment_cost(
         if price > 0:
             # Use current price as upper bound; actual OTM strike will be somewhat lower
             return price * 100 * contracts
-    # Unknown price → assume worst case to prevent approving unaffordable CSPs
-    return account_value * 0.50 * contracts
+    # No price data → return 2× account value to force rejection.
+    # Better to skip an unknown symbol than to allow an unaffordable position.
+    return account_value * 2.0 * contracts
 
 
 def _earnings_flag_in_reason(reason: str) -> bool:

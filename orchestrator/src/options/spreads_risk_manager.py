@@ -95,6 +95,7 @@ class SpreadsRiskManager:
         closing_ids = forced_close_ids | {a.position_id for a in result.approved_closes if a.position_id}
         current_spread_count = sum(1 for p in active_positions if p.id not in closing_ids)
         cash_available = cash
+        approved_spread_symbols: set[str] = {p.symbol for p in active_positions if p.id not in closing_ids}
 
         for action in decision.actions:
             if action.type != "OPEN_SPREAD":
@@ -102,6 +103,13 @@ class SpreadsRiskManager:
 
             symbol = action.symbol
             contracts = max(1, action.contracts)
+
+            # 0. Duplicate check within this cycle
+            if symbol in approved_spread_symbols:
+                reason = f"Spread for {symbol} already open or approved this cycle — skipped"
+                result.rejected_opens.append({"instruction": action, "reason": reason})
+                result.modifications.append(f"[REJECTED] {symbol} {action.spread_type}: {reason}")
+                continue
 
             # 1. Max open spreads
             if current_spread_count >= self.max_open_spreads:
@@ -136,6 +144,7 @@ class SpreadsRiskManager:
 
             # Approved
             result.approved_opens.append(action)
+            approved_spread_symbols.add(symbol)
             current_spread_count += 1
             cash_available -= estimated_max_loss
 
