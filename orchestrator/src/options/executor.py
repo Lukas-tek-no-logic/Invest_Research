@@ -91,8 +91,13 @@ class OptionsExecutor:
             active_positions: Current active positions; passed to execute_sell_cc()
                               so it can look up the parent CSP cost basis.
         """
+        seen: set[str] = set()
         results = []
         for action in opens:
+            if action.symbol in seen:
+                logger.warning("duplicate_options_open_skipped", type=action.type, symbol=action.symbol)
+                continue
+            seen.add(action.symbol)
             if action.type == "SELL_CSP":
                 results.append(self.execute_sell_csp(action))
             elif action.type == "SELL_CC":
@@ -480,16 +485,20 @@ class OptionsExecutor:
     # ── Ghostfolio helpers ────────────────────────────────────────────────────
 
     def _ghostfolio_open_csp(self, csp: SelectedCSP, contracts: int) -> str | None:
-        """Record CSP premium collected in Ghostfolio as a BUY of a synthetic asset."""
+        """Record CSP premium received in Ghostfolio as a SELL of a synthetic asset.
+
+        Selling a put = receiving cash → SELL so Ghostfolio balance increases.
+        Unit price × 100: option premium is per share, 1 contract = 100 shares.
+        """
         try:
             exp_compact = csp.expiration.replace("-", "")
             symbol = f"WHEEL-{csp.symbol}-CSP-{exp_compact}-{int(csp.strike)}P"
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
-                order_type="BUY",
+                order_type="SELL",
                 quantity=float(contracts),
-                unit_price=csp.premium,
+                unit_price=round(csp.premium * 100, 2),
                 data_source="MANUAL",
             )
             return result.get("id") if isinstance(result, dict) else None
@@ -498,16 +507,20 @@ class OptionsExecutor:
             return None
 
     def _ghostfolio_open_cc(self, cc: SelectedCC, contracts: int) -> str | None:
-        """Record CC premium collected in Ghostfolio as a BUY of a synthetic asset."""
+        """Record CC premium received in Ghostfolio as a SELL of a synthetic asset.
+
+        Selling a call = receiving cash → SELL so Ghostfolio balance increases.
+        Unit price × 100: option premium is per share, 1 contract = 100 shares.
+        """
         try:
             exp_compact = cc.expiration.replace("-", "")
             symbol = f"WHEEL-{cc.symbol}-CC-{exp_compact}-{int(cc.strike)}C"
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
-                order_type="BUY",
+                order_type="SELL",
                 quantity=float(contracts),
-                unit_price=cc.premium,
+                unit_price=round(cc.premium * 100, 2),
                 data_source="MANUAL",
             )
             return result.get("id") if isinstance(result, dict) else None
@@ -516,7 +529,11 @@ class OptionsExecutor:
             return None
 
     def _ghostfolio_close(self, pos: OptionsPosition, close_value: float) -> str | None:
-        """Record position close (buy-back) as a SELL in Ghostfolio."""
+        """Record position close (buy-back) as a BUY in Ghostfolio.
+
+        Buying back a short option = paying cash → BUY so Ghostfolio balance decreases.
+        Unit price × 100: option price is per share, 1 contract = 100 shares.
+        """
         try:
             exp_compact = pos.expiration_date.replace("-", "")
             if pos.spread_type == "CASH_SECURED_PUT":
@@ -524,15 +541,14 @@ class OptionsExecutor:
             elif pos.spread_type == "COVERED_CALL":
                 symbol = f"WHEEL-{pos.symbol}-CC-{exp_compact}-{int(pos.sell_strike)}C"
             else:
-                # Fallback for legacy spread_type values
                 symbol = f"OPT-{pos.symbol}-{pos.spread_type}-{exp_compact}"
 
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
-                order_type="SELL",
+                order_type="BUY",
                 quantity=float(pos.contracts),
-                unit_price=close_value,
+                unit_price=round(close_value * 100, 2),
                 data_source="MANUAL",
             )
             return result.get("id") if isinstance(result, dict) else None

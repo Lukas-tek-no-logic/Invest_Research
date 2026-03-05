@@ -51,8 +51,19 @@ class TradeExecutor:
 
         Returns list of TradeResult with success/failure for each.
         """
-        results = []
+        # Deduplicate by (type, symbol) — keep first occurrence regardless of source
+        seen: set[tuple[str, str]] = set()
+        deduped = []
         for action in actions:
+            key = (action.type, action.symbol)
+            if key in seen:
+                logger.warning("duplicate_trade_skipped", type=action.type, symbol=action.symbol)
+                continue
+            seen.add(key)
+            deduped.append(action)
+
+        results = []
+        for action in deduped:
             result = self._execute_single(action, account_id)
             results.append(result)
         return results

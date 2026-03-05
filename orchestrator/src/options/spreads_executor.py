@@ -68,8 +68,13 @@ class SpreadsExecutor:
         opens: list[SpreadAction],
         active_positions: list[OptionsPosition] | None = None,
     ) -> list[SpreadsTradeResult]:
+        seen: set[str] = set()
         results = []
         for action in opens:
+            if action.symbol in seen:
+                logger.warning("duplicate_spread_open_skipped", symbol=action.symbol, spread_type=action.spread_type)
+                continue
+            seen.add(action.symbol)
             results.append(self._execute_open_spread(action))
         return results
 
@@ -384,16 +389,19 @@ class SpreadsExecutor:
     # -- Ghostfolio helpers --
 
     def _ghostfolio_open(self, spread: SelectedSpread) -> str | None:
-        """Record spread open in Ghostfolio as a BUY of a synthetic asset."""
+        """Record spread open in Ghostfolio as a BUY of a synthetic asset.
+
+        Debit spread = paying cash to open → BUY (correct direction).
+        Unit price × 100: spread price is per share, 1 contract = 100 shares.
+        """
         try:
             exp_compact = spread.expiration.replace("-", "")
-            # Build strike description from legs
             strikes = "-".join(f"{int(l.strike)}" for l in spread.legs)
             symbol = f"SPREAD-{spread.symbol}-{spread.spread_type.upper()}-{exp_compact}-{strikes}"
-            # Truncate if too long for Ghostfolio
             symbol = symbol[:50]
 
-            unit_price = abs(spread.net_debit) if spread.net_debit != 0 else 0.01
+            raw_debit = abs(spread.net_debit) if spread.net_debit != 0 else 0.01
+            unit_price = round(raw_debit * 100, 2)
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
@@ -408,7 +416,11 @@ class SpreadsExecutor:
             return None
 
     def _ghostfolio_close(self, pos: OptionsPosition, close_value: float) -> str | None:
-        """Record spread close as a SELL in Ghostfolio."""
+        """Record spread close as a SELL in Ghostfolio.
+
+        Closing a debit spread = receiving cash back → SELL (correct direction).
+        Unit price × 100: spread price is per share, 1 contract = 100 shares.
+        """
         try:
             exp_compact = pos.expiration_date.replace("-", "")
             symbol = (
@@ -422,7 +434,7 @@ class SpreadsExecutor:
                 symbol=symbol,
                 order_type="SELL",
                 quantity=float(pos.contracts),
-                unit_price=close_value,
+                unit_price=round(close_value * 100, 2),
                 data_source="MANUAL",
             )
             return result.get("id") if isinstance(result, dict) else None
