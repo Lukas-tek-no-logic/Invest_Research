@@ -210,7 +210,7 @@ class Orchestrator:
                 model=model,
                 fallback_model=fallback,
                 temperature=0.3,
-                max_tokens=1024,
+                max_tokens=2048,
             )
             signal, reason, confidence = parse_scan_signal(scan_raw)
 

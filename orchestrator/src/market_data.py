@@ -120,8 +120,15 @@ class MarketDataProvider:
     def get_current_price(self, symbol: str) -> float:
         """Get just the current price (lightweight)."""
         ticker = yf.Ticker(symbol)
-        fast = ticker.fast_info
-        return fast.get("lastPrice", 0) or 0
+        try:
+            fast = ticker.fast_info
+            price = fast.get("lastPrice", 0) or 0
+            if price:
+                return price
+        except Exception:
+            pass
+        info = ticker.info
+        return info.get("currentPrice", 0) or info.get("regularMarketPrice", 0) or 0
 
     def get_upcoming_earnings(self, symbols: list[str], days: int = 14) -> dict[str, str]:
         """Get upcoming earnings dates within the next N days."""
