@@ -109,6 +109,7 @@ if not accounts:
 #   securities = Σ (per-account orders filtered by accountId) × current market prices
 # This requires one fetch each of list_accounts, list_orders, get_portfolio_holdings.
 _live_values: dict[str, dict] = {}
+_ghostfolio_ok = False
 try:
     from src.ghostfolio_client import GhostfolioClient
     _gf = GhostfolioClient()
@@ -181,8 +182,10 @@ try:
 
         _live_values[_aid] = {"total": _securities + _cash, "cash": _cash}
 
-except Exception:
-    pass  # Ghostfolio unavailable — fall back to audit log values
+    _ghostfolio_ok = True
+except Exception as _gf_err:
+    _ghostfolio_ok = False
+    _live_values = {}  # discard any partial data — use audit log consistently
 
 # Account cards — grouped by strategy
 trading_accounts = {k: v for k, v in accounts.items() if v.get("cycle_type") != "research"}
@@ -205,21 +208,25 @@ _options_pl_cache: dict[str, float] = {
     if v.get("strategy") in _OPTIONS_STRATEGIES
 }
 
-# Calculate total portfolio value across all trading accounts
+# Calculate total portfolio value across all trading accounts.
+# For all accounts (including options) use live Ghostfolio cash balance.
+# Options accounts: total = Ghostfolio balance (premiums received/debits paid already
+# reflected there after today's fix) + tiny synthetic holdings value.
+# Fallback for options: initial_budget + realized_pl if Ghostfolio data unavailable.
 initial_budget = config.get("defaults", {}).get("initial_budget", 10000)
 _total_value = 0.0
 _total_accounts = 0
 for _key, _acct in trading_accounts.items():
     _acct_budget = float(_acct.get("initial_budget", initial_budget))
-    if _acct.get("strategy") in _OPTIONS_STRATEGIES:
+    _aid = _acct.get("ghostfolio_account_id", "")
+    _live = _live_values.get(_aid, {})
+    if _live.get("total"):
+        _total_value += _live["total"]
+        _total_accounts += 1
+    elif _acct.get("strategy") in _OPTIONS_STRATEGIES:
+        # Ghostfolio unavailable — fall back to initial + realized P/L
         _total_value += _acct_budget + _options_pl_cache.get(_key, 0.0)
         _total_accounts += 1
-    else:
-        _aid = _acct.get("ghostfolio_account_id", "")
-        _live = _live_values.get(_aid, {})
-        if _live.get("total"):
-            _total_value += _live["total"]
-            _total_accounts += 1
 
 # Title row with total balance
 _title_col, _metric_col = st.columns([3, 1])
@@ -236,6 +243,9 @@ with _metric_col:
         )
     else:
         st.metric("Total Portfolio", "—")
+
+if not _ghostfolio_ok:
+    st.error("Ghostfolio niedostępny — wartości kont mogą być nieaktualne (dane z ostatniego cyklu)")
 
 audit = AuditLogger()
 
@@ -293,14 +303,15 @@ for strategy_key in _GROUP_ORDER:
             live = _live_values.get(acct_id, {})
             strategy = acct.get("strategy", "")
             acct_budget = float(acct.get("initial_budget", initial_budget))
-            if strategy in _OPTIONS_STRATEGIES:
-                # Use cumulative realized P/L from audit logs; Ghostfolio can't track options P/L
+            if live.get("total"):
+                # Use Ghostfolio balance for all accounts (options balance now correct after fix)
+                value = live["total"]
+                pl_pct = (value - acct_budget) / acct_budget * 100 if acct_budget else None
+            elif strategy in _OPTIONS_STRATEGIES:
+                # Ghostfolio unavailable — fall back to initial + realized P/L
                 realized_pl = _options_pl_cache.get(key, 0.0)
                 value = acct_budget + realized_pl
                 pl_pct = (realized_pl / acct_budget * 100) if acct_budget else None
-            elif live.get("total"):
-                value = live["total"]
-                pl_pct = (value - acct_budget) / acct_budget * 100 if acct_budget else None
             else:
                 value = latest.get("portfolio_value")
                 pl_pct = latest.get("portfolio_pl_pct")
