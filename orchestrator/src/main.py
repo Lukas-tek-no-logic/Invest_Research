@@ -82,8 +82,10 @@ class Orchestrator:
         self.audit = AuditLogger()
         self.account_mgr = AccountManager(config_path=config_path, client=self.ghostfolio)
         self.reflection = ReflectionEngine(self.llm, self.audit)
-        qdrant_url = self.config.get("defaults", {}).get("qdrant_url", "http://192.168.0.169:6333")
-        self.rag = RagClient(qdrant_url=qdrant_url, llm=self.llm)
+        defaults = self.config.get("defaults", {})
+        qdrant_url = defaults.get("qdrant_url", "http://192.168.0.169:6333")
+        ollama_url = defaults.get("ollama_url", "http://192.168.0.169:11434")
+        self.rag = RagClient(qdrant_url=qdrant_url, ollama_url=ollama_url, llm=self.llm)
 
         # Per-account cache of prices from the last intraday cycle (for Pass 0 delta)
         self._last_cycle_prices: dict[str, dict[str, float]] = {}

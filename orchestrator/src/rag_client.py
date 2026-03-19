@@ -5,6 +5,8 @@ Uses HyDE (Hypothetical Document Embeddings) for improved retrieval:
   1. LLM generates a hypothetical ideal analysis
   2. That gets embedded and used to find similar real documents
   3. Retrieved docs are injected into Pass 1 for grounded analysis.
+
+Embeddings via Ollama (nomic-embed-text) on the same server as Qdrant.
 """
 
 from __future__ import annotations
@@ -12,14 +14,14 @@ from __future__ import annotations
 import hashlib
 from datetime import datetime
 
+import requests
 import structlog
 
 logger = structlog.get_logger()
 
-# Default embedding model for fastembed (small, fast, good quality)
-EMBED_MODEL = "BAAI/bge-small-en-v1.5"
 COLLECTION_NAME = "financial_context"
-VECTOR_SIZE = 384  # bge-small-en-v1.5 dimension
+VECTOR_SIZE = 768  # nomic-embed-text dimension
+OLLAMA_EMBED_MODEL = "nomic-embed-text"
 
 
 class RagClient:
@@ -28,12 +30,13 @@ class RagClient:
     def __init__(
         self,
         qdrant_url: str = "http://192.168.0.169:6333",
+        ollama_url: str = "http://192.168.0.169:11434",
         llm=None,
     ):
         self.qdrant_url = qdrant_url
+        self.ollama_url = ollama_url
         self.llm = llm
         self._client = None
-        self._embedder = None
 
     def _get_client(self):
         if self._client is None:
@@ -48,16 +51,6 @@ class RagClient:
                 logger.warning("qdrant_connection_failed", error=str(e))
                 return None
         return self._client
-
-    def _get_embedder(self):
-        if self._embedder is None:
-            try:
-                from fastembed import TextEmbedding
-                self._embedder = TextEmbedding(model_name=EMBED_MODEL)
-            except ImportError:
-                logger.warning("fastembed_not_installed")
-                return None
-        return self._embedder
 
     def _ensure_collection(self):
         """Create collection if it doesn't exist."""
@@ -77,11 +70,23 @@ class RagClient:
             logger.info("qdrant_collection_created", name=COLLECTION_NAME)
 
     def _embed(self, texts: list[str]) -> list[list[float]]:
-        """Embed texts using fastembed."""
-        embedder = self._get_embedder()
-        if embedder is None:
-            return []
-        return list(embedder.embed(texts))
+        """Embed texts using Ollama nomic-embed-text."""
+        results = []
+        for text in texts:
+            try:
+                resp = requests.post(
+                    f"{self.ollama_url}/api/embeddings",
+                    json={"model": OLLAMA_EMBED_MODEL, "prompt": text[:2000]},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                embedding = resp.json().get("embedding", [])
+                if embedding:
+                    results.append(embedding)
+            except Exception as e:
+                logger.warning("ollama_embed_failed", error=str(e))
+                return []
+        return results
 
     def _doc_id(self, text: str, source: str) -> str:
         """Deterministic ID for dedup."""
