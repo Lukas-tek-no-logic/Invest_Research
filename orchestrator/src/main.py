@@ -25,7 +25,15 @@ from .llm_client import LLMClient
 from .market_data import MarketDataProvider
 from .news_fetcher import NewsFetcher
 from .portfolio_state import get_portfolio_state, compute_cash_from_orders
-from .prompt_builder import build_pass1_messages, build_pass2_messages, format_decision_history
+from .prompt_builder import (
+    build_pass1_messages,
+    build_pass2_messages,
+    build_bull_bear_messages,
+    build_synthesis_messages,
+    format_decision_history,
+)
+from .self_critique import ReflectionEngine
+from .rag_client import RagClient
 from .fundamental_data import format_fundamentals_for_prompt, get_fundamentals_batch
 from .risk_manager import RiskManager, RiskManagerResult, filter_by_cost_breakeven
 from .scanner import build_scan_messages, parse_scan_signal
@@ -73,6 +81,9 @@ class Orchestrator:
         self.news = NewsFetcher()
         self.audit = AuditLogger()
         self.account_mgr = AccountManager(config_path=config_path, client=self.ghostfolio)
+        self.reflection = ReflectionEngine(self.llm, self.audit)
+        qdrant_url = self.config.get("defaults", {}).get("qdrant_url", "http://192.168.0.169:6333")
+        self.rag = RagClient(qdrant_url=qdrant_url, llm=self.llm)
 
         # Per-account cache of prices from the last intraday cycle (for Pass 0 delta)
         self._last_cycle_prices: dict[str, dict[str, float]] = {}
@@ -80,6 +91,26 @@ class Orchestrator:
     def _load_config(self) -> None:
         with open(self.config_path) as f:
             self.config = yaml.safe_load(f)
+
+    def run_weekly_reflection(self) -> None:
+        """Run self-critique reflection for all active accounts."""
+        self._load_config()
+        logger.info("weekly_reflection_start")
+        for key, acct in self.config.get("accounts", {}).items():
+            if acct.get("enabled") is False:
+                continue
+            cycle_type = acct.get("cycle_type", "standard")
+            if cycle_type == "research":
+                continue  # research agent doesn't trade
+            model = acct.get("model", "QWEN3.5")
+            fallback = acct.get("fallback_model")
+            try:
+                self.reflection.run_reflection(
+                    account_key=key, model=model, fallback_model=fallback,
+                )
+            except Exception as e:
+                logger.error("reflection_failed", account=key, error=str(e))
+        logger.info("weekly_reflection_complete")
 
     @staticmethod
     def _is_wheel_account(acct: dict) -> bool:
@@ -549,6 +580,8 @@ class Orchestrator:
 
         logger.info("cycle_start", account=account_name, model=model, dry_run=self.dry_run)
         error_msg = None
+        bull_raw = {}
+        bear_raw = {}
 
         try:
             # ===== PHASE 1: GATHER CONTEXT =====
@@ -670,25 +703,95 @@ class Orchestrator:
                 opportunities=len(analysis.opportunities),
             )
 
-            # ===== PHASE 3: LLM PASS 2 - DECISIONS =====
-            logger.info("phase3_llm_decisions", account=account_name, model=model)
+            # ===== PHASE 2.5: RAG CONTEXT + BELIEFS =====
+            # Store news and research in Qdrant for future retrieval
+            rag_context = ""
+            try:
+                if news_items:
+                    self.rag.store_news(news_items)
+                if research_brief:
+                    self.rag.store_research_brief(research_brief)
+                # HyDE retrieval: use portfolio + regime as query
+                query = (
+                    f"Account: {account_name}, Strategy: {acct.get('strategy', '')}\n"
+                    f"Regime: {analysis.market_regime}\n"
+                    f"Portfolio P/L: {portfolio.total_pl_pct:+.1f}%, Cash: {portfolio.cash_pct:.0f}%"
+                )
+                held_symbols = [p.symbol for p in portfolio.positions]
+                rag_docs = self.rag.hyde_retrieve(query, symbols=held_symbols + watchlist[:10], model=model)
+                rag_context = self.rag.format_for_prompt(rag_docs)
+            except Exception as e:
+                logger.warning("rag_context_failed", error=str(e))
 
-            pass2_messages = build_pass2_messages(
+            # Load learned beliefs from self-critique
+            beliefs: list[str] = []
+            try:
+                belief_data = self.reflection.load_beliefs(account_key)
+                beliefs = belief_data.get("beliefs", [])
+                if beliefs:
+                    logger.info("beliefs_loaded", account=account_key, count=len(beliefs))
+            except Exception:
+                pass
+
+            # ===== PHASE 3: BULL vs BEAR DEBATE + SYNTHESIS =====
+            logger.info("phase3_bull_bear_debate", account=account_name, model=model)
+
+            # Bull case
+            bull_messages = build_bull_bear_messages(
                 analysis_json=analysis_raw,
                 portfolio=portfolio,
                 strategy_config=acct,
                 risk_profile=risk_profile,
+                side="bull",
+                beliefs=beliefs,
+                rag_context=rag_context,
             )
-
-            decision_raw = self.llm.chat_json(
-                messages=pass2_messages,
+            bull_raw = self.llm.chat_json(
+                messages=bull_messages,
                 model=model,
                 fallback_model=fallback,
-                temperature=0.5,
+                temperature=0.6,
             )
+            logger.info("bull_case_complete", actions=len(bull_raw.get("actions", [])))
+
+            # Bear case
+            bear_messages = build_bull_bear_messages(
+                analysis_json=analysis_raw,
+                portfolio=portfolio,
+                strategy_config=acct,
+                risk_profile=risk_profile,
+                side="bear",
+                beliefs=beliefs,
+                rag_context=rag_context,
+            )
+            bear_raw = self.llm.chat_json(
+                messages=bear_messages,
+                model=model,
+                fallback_model=fallback,
+                temperature=0.6,
+            )
+            logger.info("bear_case_complete", actions=len(bear_raw.get("actions", [])))
+
+            # Synthesis: CIO weighs both cases
+            synthesis_messages = build_synthesis_messages(
+                analysis_json=analysis_raw,
+                bull_case=bull_raw,
+                bear_case=bear_raw,
+                portfolio=portfolio,
+                strategy_config=acct,
+                risk_profile=risk_profile,
+            )
+            decision_raw = self.llm.chat_json(
+                messages=synthesis_messages,
+                model=model,
+                fallback_model=fallback,
+                temperature=0.4,
+            )
+            # Keep pass2_messages for audit (use synthesis as the "pass2")
+            pass2_messages = synthesis_messages
             decision = parse_decision(decision_raw)
             logger.info(
-                "decision_complete",
+                "synthesis_complete",
                 actions=len(decision.actions),
                 outlook=decision.portfolio_outlook,
                 confidence=decision.confidence,
@@ -819,6 +922,8 @@ class Orchestrator:
             logger.error("cycle_failed", account=account_name, error=error_msg, exc_info=True)
             analysis_raw = {}
             decision_raw = {}
+            bull_raw = {}
+            bear_raw = {}
             pass1_messages = []
             pass2_messages = []
             risk_result = RiskManagerResult()
@@ -827,6 +932,11 @@ class Orchestrator:
             portfolio_after = {}
 
         # ===== PHASE 6: AUDIT LOGGING =====
+        # Include bull/bear debate in pass2_response for full audit trail
+        decision_with_debate = dict(decision_raw)
+        if bull_raw or bear_raw:
+            decision_with_debate["_bull_case"] = bull_raw
+            decision_with_debate["_bear_case"] = bear_raw
         log_file = self.audit.log_cycle(
             account_key=account_key,
             account_name=account_name,
@@ -834,7 +944,7 @@ class Orchestrator:
             pass1_messages=pass1_messages,
             pass1_response=analysis_raw,
             pass2_messages=pass2_messages,
-            pass2_response=decision_raw,
+            pass2_response=decision_with_debate,
             risk_modifications=risk_result.modifications,
             risk_warnings=risk_result.warnings,
             forced_actions=[
@@ -1494,6 +1604,16 @@ def main():
             )
         except Exception as e:
             logger.error("scheduler_setup_failed", account=key, error=str(e))
+
+    # Weekly self-critique reflection (Sunday 19:00 — before weekly trading cycles)
+    scheduler.add_job(
+        orch.run_weekly_reflection,
+        trigger=CronTrigger(day_of_week="sun", hour=19, minute=0, timezone="Europe/Warsaw"),
+        id="weekly_reflection",
+        name="Weekly self-critique reflection",
+        misfire_grace_time=3600,
+    )
+    logger.info("scheduler_reflection_added", cron="0 19 * * 0")
 
     # Graceful shutdown
     def shutdown(signum, frame):

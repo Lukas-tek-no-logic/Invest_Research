@@ -153,6 +153,8 @@ def build_pass2_messages(
     portfolio: PortfolioState,
     strategy_config: dict,
     risk_profile: dict,
+    beliefs: list[str] | None = None,
+    rag_context: str = "",
 ) -> list[dict[str, str]]:
     """Build messages for Pass 2: Trading Decision.
 
@@ -305,13 +307,25 @@ def build_pass2_messages(
 
     constraints_text = "\n".join(constraints_lines)
 
+    # Beliefs from self-critique (verbal reinforcement)
+    beliefs_text = ""
+    if beliefs:
+        beliefs_text = (
+            "\n== YOUR LEARNED BELIEFS (from past performance review) ==\n"
+            + "\n".join(f"- {b}" for b in beliefs)
+            + "\nApply these beliefs when making decisions. Violate only with strong justification.\n"
+        )
+
     today = datetime.now().strftime("%A %Y-%m-%d")
+    rag_section = f"\n{rag_context}\n" if rag_context else ""
     user_prompt = (
         f"== TODAY: {today} ==\n\n"
         f"== MARKET ANALYSIS (from senior analyst) ==\n"
         f"{json.dumps(analysis_json, indent=2)}\n\n"
         f"{portfolio.to_prompt_text()}\n\n"
-        f"{constraints_text}\n\n"
+        f"{constraints_text}\n"
+        f"{beliefs_text}"
+        f"{rag_section}\n"
         f"Decide your trades and respond with the JSON decision."
     )
 
@@ -397,3 +411,168 @@ def format_decision_history(history: list[dict], max_entries: int = 4) -> str:
                 lines.append(f"  Reason: \"{reason}\"")
 
     return "\n".join(lines)
+
+
+def build_bull_bear_messages(
+    analysis_json: dict,
+    portfolio: PortfolioState,
+    strategy_config: dict,
+    risk_profile: dict,
+    side: str,  # "bull" or "bear"
+    beliefs: list[str] | None = None,
+    rag_context: str = "",
+) -> list[dict[str, str]]:
+    """Build a biased Pass 2 prompt for bull/bear debate.
+
+    Same data as regular Pass 2 but with a directional bias in the system prompt.
+    """
+    import json
+
+    strategy = strategy_config.get("strategy", "balanced")
+    horizon = strategy_config.get("horizon", "weeks to months")
+    max_trades = risk_profile.get("max_trades_per_cycle", 5)
+    max_position_pct = risk_profile.get("max_position_pct", 20)
+    min_cash_pct = risk_profile.get("min_cash_pct", 10)
+    max_position_usd = portfolio.total_value * max_position_pct / 100
+    buying_power = max(0, portfolio.cash - portfolio.total_value * min_cash_pct / 100)
+
+    if side == "bull":
+        bias = (
+            "You are the BULLISH advocate. Your job is to find the STRONGEST reasons "
+            "to BUY or HOLD positions. Look for undervalued opportunities, positive "
+            "momentum signals, upcoming catalysts, and beaten-down stocks ready to rebound. "
+            "Challenge bearish narratives — find counter-arguments. "
+            "However, do NOT be reckless — cite specific data for every thesis."
+        )
+    else:
+        bias = (
+            "You are the BEARISH advocate. Your job is to find the STRONGEST reasons "
+            "to SELL, trim, or AVOID buying. Look for overvalued positions, deteriorating "
+            "fundamentals, broken technicals, and macro headwinds. "
+            "Challenge bullish narratives — find risks others miss. "
+            "However, do NOT be blindly negative — acknowledge genuine strength where data supports it."
+        )
+
+    system_prompt = (
+        f"You are a {side.upper()} portfolio analyst for a {strategy} strategy.\n"
+        f"Investment horizon: {horizon}\n\n"
+        f"{bias}\n\n"
+        f"Constraints: max {max_trades} trades, max {max_position_pct}% per position "
+        f"(=${max_position_usd:,.0f}), min {min_cash_pct}% cash reserve.\n"
+        f"Buying power: ${buying_power:,.2f}\n\n"
+        "IMPORTANT: ONLY reference data explicitly provided. Do NOT fabricate indicators.\n\n"
+        "Respond with JSON:\n"
+        "{\n"
+        f'  "side": "{side}",\n'
+        '  "thesis": "Your overall argument (2-3 sentences)",\n'
+        '  "actions": [\n'
+        '    {"type": "BUY|SELL", "symbol": "X", "amount_usd": N, "thesis": "why"}\n'
+        '  ],\n'
+        '  "key_risks": ["risk if your thesis is wrong"],\n'
+        '  "confidence": 0.0-1.0\n'
+        "}\n"
+    )
+
+    beliefs_text = ""
+    if beliefs:
+        beliefs_text = (
+            "\n== LEARNED BELIEFS ==\n"
+            + "\n".join(f"- {b}" for b in beliefs) + "\n"
+        )
+    rag_section = f"\n{rag_context}\n" if rag_context else ""
+
+    today = datetime.now().strftime("%A %Y-%m-%d")
+    user_prompt = (
+        f"== TODAY: {today} ==\n\n"
+        f"== MARKET ANALYSIS ==\n{json.dumps(analysis_json, indent=2)}\n\n"
+        f"{portfolio.to_prompt_text()}\n"
+        f"{beliefs_text}{rag_section}\n"
+        f"Present your {side.upper()} case."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+
+def build_synthesis_messages(
+    analysis_json: dict,
+    bull_case: dict,
+    bear_case: dict,
+    portfolio: PortfolioState,
+    strategy_config: dict,
+    risk_profile: dict,
+) -> list[dict[str, str]]:
+    """Build synthesis prompt that combines bull and bear arguments into final decision."""
+    import json
+
+    strategy = strategy_config.get("strategy", "balanced")
+    prompt_style = strategy_config.get("prompt_style", "")
+    horizon = strategy_config.get("horizon", "weeks to months")
+    max_trades = risk_profile.get("max_trades_per_cycle", 5)
+    max_position_pct = risk_profile.get("max_position_pct", 20)
+    min_cash_pct = risk_profile.get("min_cash_pct", 10)
+    stop_loss_pct = risk_profile.get("stop_loss_pct", -15)
+    max_position_usd = portfolio.total_value * max_position_pct / 100
+
+    system_prompt = (
+        f"You are the CHIEF INVESTMENT OFFICER making final trading decisions for a {strategy} strategy.\n"
+        f"Style: {prompt_style}\n"
+        f"Horizon: {horizon}\n\n"
+        "You have received arguments from two analysts:\n"
+        "- A BULL advocate arguing for buying opportunities\n"
+        "- A BEAR advocate arguing for selling/risk reduction\n\n"
+        "Your job: SYNTHESIZE both perspectives into a balanced final decision. "
+        "Weigh the strength of each argument, the quality of evidence cited, "
+        "and the current portfolio state. You are NOT obligated to follow either side — "
+        "you can HOLD if neither case is compelling enough.\n\n"
+        "RULES:\n"
+        f"- Max {max_trades} trades per cycle\n"
+        f"- No position > {max_position_pct}% (=${max_position_usd:,.0f})\n"
+        f"- Min {min_cash_pct}% cash reserve\n"
+        "- ONLY reference data from the analysis — do NOT fabricate\n"
+        "- Every trade needs a specific thesis citing data\n\n"
+        "Respond with JSON:\n"
+        "{\n"
+        '  "reasoning": "How you weighed bull vs bear arguments",\n'
+        '  "actions": [\n'
+        "    {\n"
+        '      "type": "BUY" | "SELL",\n'
+        '      "symbol": "TICKER",\n'
+        '      "amount_usd": 1000,\n'
+        '      "urgency": "HIGH" | "MEDIUM" | "LOW",\n'
+        '      "thesis": "Synthesized reasoning from bull/bear debate",\n'
+        f'      "stop_loss_pct": {stop_loss_pct},\n'
+        '      "take_profit_pct": 25.0,\n'
+        '      "time_stop_days": 30\n'
+        "    }\n"
+        "  ],\n"
+        '  "portfolio_outlook": "BULLISH|CAUTIOUSLY_BULLISH|NEUTRAL|CAUTIOUSLY_BEARISH|BEARISH",\n'
+        '  "confidence": 0.0-1.0,\n'
+        '  "next_cycle_focus": "What to watch",\n'
+        '  "suggest_symbols": ["TICK1", "TICK2"]\n'
+        "}\n"
+    )
+
+    today = datetime.now().strftime("%A %Y-%m-%d")
+    user_prompt = (
+        f"== TODAY: {today} ==\n\n"
+        f"== MARKET CONTEXT ==\n"
+        f"Regime: {analysis_json.get('market_regime', 'Unknown')}\n\n"
+        f"{portfolio.to_prompt_text()}\n\n"
+        f"== BULL CASE (confidence: {bull_case.get('confidence', '?')}) ==\n"
+        f"Thesis: {bull_case.get('thesis', 'N/A')}\n"
+        f"Proposed trades: {json.dumps(bull_case.get('actions', []), indent=2)}\n"
+        f"Risks if wrong: {json.dumps(bull_case.get('key_risks', []))}\n\n"
+        f"== BEAR CASE (confidence: {bear_case.get('confidence', '?')}) ==\n"
+        f"Thesis: {bear_case.get('thesis', 'N/A')}\n"
+        f"Proposed trades: {json.dumps(bear_case.get('actions', []), indent=2)}\n"
+        f"Risks if wrong: {json.dumps(bear_case.get('key_risks', []))}\n\n"
+        "Synthesize both cases and make your final trading decision."
+    )
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]

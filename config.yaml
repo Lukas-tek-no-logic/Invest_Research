@@ -6,6 +6,7 @@ defaults:
   ghostfolio_url: http://192.168.0.12:3333
   news_cache_ttl_minutes: 15
   quote_cache_ttl_seconds: 60
+  qdrant_url: http://192.168.0.169:6333
 
 accounts:
   research:
