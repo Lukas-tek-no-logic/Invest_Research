@@ -240,17 +240,18 @@ def _format_active_positions(positions: list[OptionsPosition]) -> str:
     if not positions:
         return "== ACTIVE WHEEL POSITIONS ==\n(none — no open CSPs or CCs)"
 
-    csps = [p for p in positions if p.spread_type == "CASH_SECURED_PUT"]
+    csps = [p for p in positions if p.spread_type == "CASH_SECURED_PUT" and p.wheel_state != "ASSIGNED"]
     ccs = [p for p in positions if p.spread_type == "COVERED_CALL"]
-    other = [p for p in positions if p.spread_type not in ("CASH_SECURED_PUT", "COVERED_CALL")]
+    assigned = [p for p in positions if p.wheel_state == "ASSIGNED"]
+    other = [p for p in positions if p.spread_type not in ("CASH_SECURED_PUT", "COVERED_CALL") and p.wheel_state != "ASSIGNED"]
 
     lines = [
         "== ACTIVE WHEEL POSITIONS ==",
-        f"Open CSPs: {len(csps)}  |  Open CCs: {len(ccs)}  |  Other: {len(other)}",
+        f"Open CSPs: {len(csps)}  |  Open CCs: {len(ccs)}  |  Assigned (holding shares): {len(assigned)}",
         "",
     ]
 
-    for p in positions:
+    for p in csps + ccs + other:
         pl_str = f"${p.current_pl:+,.2f}" if p.current_pl is not None else "N/A"
         pct = f"{p.profit_captured_pct:.0f}% captured" if p.profit_captured_pct is not None else ""
         lines.append(
@@ -258,6 +259,17 @@ def _format_active_positions(positions: list[OptionsPosition]) -> str:
             f"strike={p.sell_strike}  exp={p.expiration_date}  DTE:{p.dte}  "
             f"P&L:{pl_str}  {pct}"
         )
+
+    if assigned:
+        lines.append("")
+        lines.append("== ASSIGNED SHARES (sell Covered Calls on these!) ==")
+        for p in assigned:
+            lines.append(
+                f"  [{p.id}] {p.symbol}: {p.wheel_shares} shares @ cost basis ${p.wheel_cost_basis:.2f}"
+                f"  (assigned from CSP strike={p.sell_strike})"
+                f"  ⚠ SELL_CC above ${p.wheel_cost_basis:.2f} to complete wheel cycle"
+            )
+
     return "\n".join(lines)
 
 

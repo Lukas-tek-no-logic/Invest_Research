@@ -17,6 +17,7 @@ Ghostfolio integration:
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
 
@@ -225,6 +226,12 @@ class OptionsExecutor:
                         "net_theta": 0.0, "net_vega": 0.0},
                 dte=csp.dte,
             )
+            # Set wheel state
+            with sqlite3.connect(self.tracker.db_path) as conn:
+                conn.execute(
+                    "UPDATE options_positions SET wheel_state='CSP_OPEN' WHERE id=?",
+                    (pos_id,),
+                )
 
             logger.info(
                 "wheel_csp_opened",
@@ -339,13 +346,27 @@ class OptionsExecutor:
                 dte=cc.dte,
             )
 
+            # Link CC to parent assigned CSP and update wheel states
+            parent_id = action.position_id
+            with sqlite3.connect(self.tracker.db_path) as conn:
+                conn.execute(
+                    "UPDATE options_positions SET wheel_state='CC_OPEN', "
+                    "wheel_parent_id=?, wheel_cost_basis=?, wheel_shares=? WHERE id=?",
+                    (parent_id, cost_basis, action.contracts * 100, pos_id),
+                )
+                if parent_id:
+                    conn.execute(
+                        "UPDATE options_positions SET wheel_state='CC_OPEN' WHERE id=?",
+                        (parent_id,),
+                    )
+
             logger.info(
                 "wheel_cc_opened",
                 pos_id=pos_id, symbol=cc.symbol,
                 strike=cc.strike, expiration=cc.expiration,
                 premium=cc.premium, cost_basis=cost_basis,
                 delta=round(cc.delta, 3), contracts=action.contracts,
-                parent_position_id=action.position_id,
+                parent_position_id=parent_id,
             )
 
             return OptionsTradeResult(
@@ -431,6 +452,47 @@ class OptionsExecutor:
             dte = max((exp_date - today).days, 0)
 
             if dte == 0:
+                # Check if CSP expired ITM (assignment) or OTM (worthless)
+                if pos.spread_type == "CASH_SECURED_PUT":
+                    stock_price = self._get_stock_price(pos.symbol)
+                    if stock_price and stock_price < pos.sell_strike:
+                        # ITM — assignment! We now own 100 shares at strike price
+                        logger.info(
+                            "wheel_csp_assignment_detected",
+                            pos_id=pos.id, symbol=pos.symbol,
+                            strike=pos.sell_strike, stock_price=stock_price,
+                        )
+                        cost_basis = self.tracker.assign_position(pos.id, stock_price)
+                        # Record stock purchase in Ghostfolio
+                        self._ghostfolio_assignment(pos, cost_basis)
+                        return OptionsTradeResult(
+                            action="ASSIGNMENT", symbol=pos.symbol,
+                            spread_type=pos.spread_type,
+                            position_id=pos.id, success=True,
+                        )
+                elif pos.spread_type == "COVERED_CALL":
+                    stock_price = self._get_stock_price(pos.symbol)
+                    if stock_price and stock_price > pos.sell_strike:
+                        # CC exercised — shares called away
+                        logger.info(
+                            "wheel_cc_exercised",
+                            pos_id=pos.id, symbol=pos.symbol,
+                            strike=pos.sell_strike, stock_price=stock_price,
+                        )
+                        cc_premium = abs(pos.entry_debit or 0)
+                        realized_pl = self.tracker.call_away_position(
+                            pos.id, pos.sell_strike, cc_premium,
+                        )
+                        # Record stock sale in Ghostfolio
+                        self._ghostfolio_call_away(pos)
+                        return OptionsTradeResult(
+                            action="CALLED_AWAY", symbol=pos.symbol,
+                            spread_type=pos.spread_type,
+                            position_id=pos.id, success=True,
+                            realized_pl=realized_pl,
+                        )
+
+                # OTM expiry — worthless
                 logger.info("wheel_position_expired", pos_id=pos.id, symbol=pos.symbol)
                 self.tracker.expire_position(pos.id)
                 return OptionsTradeResult(
@@ -526,6 +588,63 @@ class OptionsExecutor:
             return result.get("id") if isinstance(result, dict) else None
         except Exception as e:
             logger.error("ghostfolio_cc_open_failed", symbol=cc.symbol, error=str(e))
+            return None
+
+    def _get_stock_price(self, symbol: str) -> float | None:
+        """Get current stock price for assignment detection."""
+        try:
+            return self.market_data.get_current_price(symbol)
+        except Exception:
+            return None
+
+    def _ghostfolio_assignment(self, pos: OptionsPosition, cost_basis: float) -> str | None:
+        """Record CSP assignment as stock BUY in Ghostfolio.
+
+        When assigned, we buy 100 shares per contract at the strike price.
+        """
+        try:
+            shares = pos.contracts * 100
+            result = self.ghostfolio.create_order(
+                account_id=self.account_id,
+                symbol=pos.symbol,
+                order_type="BUY",
+                quantity=float(shares),
+                unit_price=pos.sell_strike,
+                data_source="YAHOO",
+            )
+            logger.info(
+                "ghostfolio_assignment_recorded",
+                symbol=pos.symbol, shares=shares,
+                strike=pos.sell_strike, cost_basis=cost_basis,
+            )
+            return result.get("id") if isinstance(result, dict) else None
+        except Exception as e:
+            logger.error("ghostfolio_assignment_failed", symbol=pos.symbol, error=str(e))
+            return None
+
+    def _ghostfolio_call_away(self, pos: OptionsPosition) -> str | None:
+        """Record CC exercise as stock SELL in Ghostfolio.
+
+        When called away, we sell 100 shares per contract at the CC strike price.
+        """
+        try:
+            shares = pos.contracts * 100
+            result = self.ghostfolio.create_order(
+                account_id=self.account_id,
+                symbol=pos.symbol,
+                order_type="SELL",
+                quantity=float(shares),
+                unit_price=pos.sell_strike,
+                data_source="YAHOO",
+            )
+            logger.info(
+                "ghostfolio_call_away_recorded",
+                symbol=pos.symbol, shares=shares,
+                strike=pos.sell_strike,
+            )
+            return result.get("id") if isinstance(result, dict) else None
+        except Exception as e:
+            logger.error("ghostfolio_call_away_failed", symbol=pos.symbol, error=str(e))
             return None
 
     def _ghostfolio_close(self, pos: OptionsPosition, close_value: float) -> str | None:

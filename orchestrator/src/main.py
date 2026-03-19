@@ -1399,7 +1399,20 @@ class Orchestrator:
             }
 
             active_positions = tracker.get_active_positions(account_key)
-            logger.info("options_active_positions", count=len(active_positions))
+            # Include assigned positions (holding shares — ready for CC selling)
+            assigned_positions = tracker.get_assigned_positions(account_key)
+            all_positions = active_positions + assigned_positions
+            logger.info(
+                "options_active_positions",
+                count=len(active_positions),
+                assigned=len(assigned_positions),
+            )
+
+            # Add assigned symbols to watchlist for market data
+            assigned_symbols = [p.symbol for p in assigned_positions]
+            for sym in assigned_symbols:
+                if sym not in watchlist:
+                    watchlist.append(sym)
 
             # Market data + indicators
             quotes = self.market_data.get_quotes_batch(watchlist)
@@ -1458,7 +1471,7 @@ class Orchestrator:
                 technical_signals=tech_signals,
                 news_text=news_text,
                 strategy_config=acct,
-                active_positions=active_positions,
+                active_positions=all_positions,
                 iv_data=iv_data,
                 portfolio_greeks=portfolio_greeks,
             )
@@ -1483,7 +1496,7 @@ class Orchestrator:
                 portfolio=portfolio,
                 strategy_config=acct,
                 risk_profile=risk_profile,
-                active_positions=active_positions,
+                active_positions=all_positions,
                 portfolio_greeks=portfolio_greeks,
                 decision_history=history_text,
                 market_data=market_data,

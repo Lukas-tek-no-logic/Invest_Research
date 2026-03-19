@@ -53,6 +53,16 @@ class OptionsPosition:
     buy_contract_symbol: str | None = None
     sell_contract_symbol: str | None = None
 
+    # Wheel state machine
+    wheel_state: str | None = None  # CSP_OPEN, ASSIGNED, CC_OPEN, CALLED_AWAY, COMPLETE
+    wheel_cost_basis: float | None = None  # effective cost basis after assignment
+    wheel_shares: int = 0  # shares held after assignment (100 per contract)
+    wheel_parent_id: int | None = None  # links CC back to assigned CSP
+
+    @property
+    def is_assigned(self) -> bool:
+        return self.wheel_state == "ASSIGNED"
+
     @property
     def pl_pct(self) -> float | None:
         """Unrealized P&L as % of max loss."""
@@ -118,6 +128,17 @@ class OptionsPositionTracker:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Wheel state columns (added incrementally)
+            for col, typedef in [
+                ("wheel_state", "TEXT"),
+                ("wheel_cost_basis", "REAL"),
+                ("wheel_shares", "INTEGER DEFAULT 0"),
+                ("wheel_parent_id", "INTEGER"),
+            ]:
+                try:
+                    conn.execute(f"ALTER TABLE options_positions ADD COLUMN {col} {typedef}")
+                except sqlite3.OperationalError:
+                    pass  # column already exists
 
     # ── Write operations ────────────────────────────────────────────────────
 
@@ -237,22 +258,124 @@ class OptionsPositionTracker:
         return realized_pl
 
     def expire_position(self, position_id: int) -> None:
-        """Mark position as expired (worthless or ITM)."""
+        """Mark position as expired OTM (worthless — keep full premium)."""
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
-                "SELECT entry_debit, contracts FROM options_positions WHERE id=?",
+                "SELECT entry_debit, contracts, spread_type FROM options_positions WHERE id=?",
                 (position_id,),
             ).fetchone()
             if row:
-                entry_debit, contracts = row
+                entry_debit, contracts, spread_type = row
                 realized_pl = round(-entry_debit * contracts * 100, 2)
                 conn.execute(
                     """UPDATE options_positions
                     SET status='expired', close_date=?, close_value=0,
-                        realized_pl=?, close_reason='EXPIRED'
+                        realized_pl=?, close_reason='EXPIRED_OTM',
+                        wheel_state='COMPLETE'
                     WHERE id=?""",
                     (date.today().isoformat(), realized_pl, position_id),
                 )
+
+    def assign_position(self, position_id: int, stock_price: float) -> float:
+        """Mark CSP as assigned — we now own 100 shares per contract.
+
+        Returns the effective cost basis per share (strike - premium received).
+        Creates a Ghostfolio BUY order for the assigned shares.
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT sell_strike, entry_debit, contracts FROM options_positions WHERE id=?",
+                (position_id,),
+            ).fetchone()
+            if not row:
+                logger.error("assign_position_not_found", id=position_id)
+                return 0.0
+
+            strike, entry_debit, contracts = row
+            premium_received = abs(entry_debit)
+            cost_basis = round(strike - premium_received, 2)
+            shares = contracts * 100
+
+            conn.execute(
+                """UPDATE options_positions
+                SET status='assigned',
+                    wheel_state='ASSIGNED',
+                    wheel_cost_basis=?,
+                    wheel_shares=?,
+                    close_date=?,
+                    close_reason='ASSIGNED_ITM'
+                WHERE id=?""",
+                (cost_basis, shares, date.today().isoformat(), position_id),
+            )
+
+        logger.info(
+            "wheel_csp_assigned",
+            id=position_id, strike=strike, premium=premium_received,
+            cost_basis=cost_basis, shares=shares, stock_price=stock_price,
+        )
+        return cost_basis
+
+    def call_away_position(self, position_id: int, cc_strike: float, cc_premium: float) -> float:
+        """Mark CC as exercised — shares sold at CC strike. Wheel cycle complete.
+
+        Returns total realized P&L for the full wheel cycle:
+          (CC strike - cost_basis + CC premium) × shares
+        """
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT wheel_cost_basis, wheel_shares, wheel_parent_id FROM options_positions WHERE id=?",
+                (position_id,),
+            ).fetchone()
+            if not row:
+                logger.error("call_away_position_not_found", id=position_id)
+                return 0.0
+
+            cost_basis, shares, parent_id = row
+            cost_basis = cost_basis or 0
+            shares = shares or 100
+            # Total P&L = (sell price - cost basis) × shares + CC premium × 100
+            realized_pl = round((cc_strike - cost_basis) * shares + cc_premium * shares, 2)
+
+            conn.execute(
+                """UPDATE options_positions
+                SET status='closed',
+                    wheel_state='COMPLETE',
+                    close_date=?,
+                    realized_pl=?,
+                    close_reason='CALLED_AWAY'
+                WHERE id=?""",
+                (date.today().isoformat(), realized_pl, position_id),
+            )
+
+            # Also mark parent CSP as complete if exists
+            if parent_id:
+                conn.execute(
+                    "UPDATE options_positions SET wheel_state='COMPLETE' WHERE id=?",
+                    (parent_id,),
+                )
+
+        logger.info(
+            "wheel_called_away",
+            id=position_id, cc_strike=cc_strike, cost_basis=cost_basis,
+            cc_premium=cc_premium, realized_pl=realized_pl,
+        )
+        return realized_pl
+
+    def get_assigned_positions(self, account_key: str) -> list["OptionsPosition"]:
+        """Return positions in ASSIGNED state (holding shares, ready for CC)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """SELECT * FROM options_positions
+                    WHERE account_key=? AND wheel_state='ASSIGNED'
+                    ORDER BY close_date ASC""",
+                    (account_key,),
+                ).fetchall()
+            return [_row_to_position(dict(row)) for row in rows]
+        except Exception as e:
+            logger.error("get_assigned_failed", error=str(e))
+            return []
 
     # ── Read operations ─────────────────────────────────────────────────────
 
@@ -367,4 +490,8 @@ def _row_to_position(row: dict) -> OptionsPosition:
         ghostfolio_close_order_id=row.get("ghostfolio_close_order_id"),
         buy_contract_symbol=row.get("buy_contract_symbol"),
         sell_contract_symbol=row.get("sell_contract_symbol"),
+        wheel_state=row.get("wheel_state"),
+        wheel_cost_basis=row.get("wheel_cost_basis"),
+        wheel_shares=row.get("wheel_shares", 0) or 0,
+        wheel_parent_id=row.get("wheel_parent_id"),
     )
