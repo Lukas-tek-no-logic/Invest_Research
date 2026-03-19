@@ -82,6 +82,23 @@ class RiskManager:
         """
         result = RiskManagerResult()
 
+        # 0. Force-close zombie positions (< $5 value) — not worth the drag
+        zombie_threshold = 5.0
+        for position in portfolio.positions:
+            if 0 < position.market_value < zombie_threshold:
+                result.forced_actions.append(TradeAction(
+                    type="SELL",
+                    symbol=position.symbol,
+                    amount_usd=position.market_value,
+                    urgency="HIGH",
+                    thesis=f"ZOMBIE CLEANUP: position worth ${position.market_value:.2f} — "
+                           f"closing to eliminate dead weight",
+                    exit_condition="Immediate cleanup",
+                ))
+                result.modifications.append(
+                    f"FORCED ZOMBIE SELL {position.symbol}: ${position.market_value:.2f} < ${zombie_threshold}"
+                )
+
         # 1. Check stop-losses BEFORE model actions
         forced_sells = self._check_stop_losses(portfolio)
         result.forced_actions.extend(forced_sells)
@@ -430,6 +447,11 @@ def filter_by_cost_breakeven(
     filtered_out: list[dict] = []
 
     for action in actions:
+        # Zombie cleanup actions bypass cost filter — closing dead weight is always worth the fee
+        if action.amount_usd < 5.0 and action.type == "SELL" and "ZOMBIE" in action.thesis.upper():
+            approved.append(action)
+            continue
+
         # Estimate price: prefer live portfolio price, fall back to rough calc
         pos = portfolio.get_position(action.symbol)
         price = pos.current_price if pos else 0.0
