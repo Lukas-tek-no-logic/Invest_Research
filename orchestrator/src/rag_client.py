@@ -239,24 +239,11 @@ class RagClient:
         if not embeddings:
             return []
 
-        # Step 3: Search Qdrant
+        # Step 3: Search Qdrant (no filter — rely on embedding similarity)
         try:
-            from qdrant_client.models import Filter, FieldCondition, MatchAny
-            search_filter = None
-            if symbols:
-                search_filter = Filter(
-                    should=[
-                        FieldCondition(key="symbols", match=MatchAny(any=symbols)),
-                        # Also match docs without symbol filter (regime/themes)
-                        FieldCondition(key="source", match=MatchAny(any=["research"])),
-                    ]
-                )
-
-            from qdrant_client.models import Query
             response = client.query_points(
                 collection_name=COLLECTION_NAME,
                 query=embeddings[0],
-                query_filter=search_filter,
                 limit=top_k,
             )
             docs = []
