@@ -94,6 +94,119 @@ class Orchestrator:
         with open(self.config_path) as f:
             self.config = yaml.safe_load(f)
 
+    def run_options_maintenance(self) -> None:
+        """Daily maintenance: update P/L, check take-profit, handle expirations.
+
+        Runs independently of the weekly options cycle to catch:
+        - Take-profit triggers (>50% captured) that happen between cycles
+        - Expiring positions (DTE ≤ 1) that need settlement
+        - P/L updates for dashboard accuracy
+        """
+        self._load_config()
+        logger.info("options_maintenance_start")
+
+        for key, acct in self.config.get("accounts", {}).items():
+            if acct.get("enabled") is False:
+                continue
+            if not self._is_options_account(acct):
+                continue
+
+            account_id = acct.get("ghostfolio_account_id", "")
+            account_name = acct.get("name", key)
+            risk_profile = acct.get("risk_profile", {})
+            take_profit_pct = risk_profile.get("take_profit_pct", 50.0)
+            auto_close_dte = risk_profile.get("auto_close_dte", 3)
+
+            try:
+                tracker = OptionsPositionTracker()
+                active = tracker.get_active_positions(key)
+                if not active:
+                    continue
+
+                # Update P/L for all active positions
+                if self._is_spreads_account(acct):
+                    executor = SpreadsExecutor(
+                        ghostfolio=self.ghostfolio,
+                        tracker=tracker,
+                        risk_profile=risk_profile,
+                        dry_run=self.dry_run,
+                        account_key=key,
+                    )
+                else:
+                    executor = OptionsExecutor(
+                        ghostfolio=self.ghostfolio,
+                        tracker=tracker,
+                        risk_profile=risk_profile,
+                        dry_run=self.dry_run,
+                        account_key=key,
+                    )
+
+                update_results = executor.update_active_positions(active)
+                logger.info(
+                    "options_maintenance_updated",
+                    account=account_name,
+                    positions=len(active),
+                    updated=sum(1 for r in update_results if r.success),
+                )
+
+                # Re-read positions after update (fresh P/L)
+                active = tracker.get_active_positions(key)
+
+                # Check for take-profit and auto-close triggers
+                closes_needed = []
+                for pos in active:
+                    captured = pos.profit_captured_pct
+                    if captured is not None and captured >= take_profit_pct:
+                        closes_needed.append(pos)
+                        logger.info(
+                            "maintenance_take_profit",
+                            account=account_name,
+                            symbol=pos.symbol,
+                            captured_pct=round(captured, 1),
+                        )
+                    elif pos.dte is not None and pos.dte <= auto_close_dte:
+                        closes_needed.append(pos)
+                        logger.info(
+                            "maintenance_dte_close",
+                            account=account_name,
+                            symbol=pos.symbol,
+                            dte=pos.dte,
+                        )
+
+                if closes_needed:
+                    from .options.decision_parser import WheelAction
+                    close_actions = [
+                        WheelAction(
+                            type="CLOSE",
+                            symbol=pos.symbol,
+                            position_id=pos.id,
+                            reason=f"Maintenance: "
+                                   f"{'take-profit ' + str(round(pos.profit_captured_pct or 0)) + '%' if (pos.profit_captured_pct or 0) >= take_profit_pct else 'DTE=' + str(pos.dte)}",
+                        )
+                        for pos in closes_needed
+                    ]
+                    close_results = executor.execute_closes(close_actions, active)
+                    for r in close_results:
+                        if r.success:
+                            logger.info(
+                                "maintenance_closed",
+                                account=account_name,
+                                symbol=r.symbol,
+                                realized_pl=r.realized_pl,
+                            )
+                        else:
+                            logger.error(
+                                "maintenance_close_failed",
+                                account=account_name,
+                                symbol=r.symbol,
+                                error=r.error,
+                            )
+
+            except Exception as e:
+                logger.error("options_maintenance_failed", account=key, error=str(e))
+
+        logger.info("options_maintenance_complete")
+
     def run_weekly_reflection(self) -> None:
         """Run self-critique reflection for all active accounts."""
         self._load_config()
@@ -1606,6 +1719,16 @@ def main():
             )
         except Exception as e:
             logger.error("scheduler_setup_failed", account=key, error=str(e))
+
+    # Daily options maintenance (Mon-Fri 17:00 — update P/L, check take-profit/expiry)
+    scheduler.add_job(
+        orch.run_options_maintenance,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone="Europe/Warsaw"),
+        id="options_maintenance",
+        name="Daily options maintenance (P/L + take-profit + expiry)",
+        misfire_grace_time=1800,
+    )
+    logger.info("scheduler_options_maintenance_added", cron="0 17 * * 1-5")
 
     # Weekly self-critique reflection (Sunday 19:00 — before weekly trading cycles)
     scheduler.add_job(
