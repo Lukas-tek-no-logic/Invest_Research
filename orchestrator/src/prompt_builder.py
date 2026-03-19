@@ -35,7 +35,11 @@ def build_pass1_messages(
         "- For HELD positions: assess whether to stay (fundamental thesis intact?) "
         "or exit (earnings miss, analyst downgrades, thesis broken?).\n"
         "- For NEW opportunities: evaluate analyst consensus, growth trajectory, "
-        "and whether the setup warrants entry.\n\n"
+        "and whether the setup warrants entry.\n"
+        "- ONLY cite data that is EXPLICITLY present in the market data / "
+        "technical indicators sections below. Do NOT invent, estimate, or hallucinate "
+        "any numbers (IV, SMA, MACD, RSI, analyst targets). If a metric is missing, "
+        "say 'N/A' — never fabricate it.\n\n"
         "You MUST respond with valid JSON matching this schema:\n"
         "{\n"
         '  "market_regime": "BULL_TREND" | "BEAR_TREND" | "SIDEWAYS" | "HIGH_VOLATILITY",\n'
@@ -182,6 +186,18 @@ def build_pass2_messages(
         f"  Current universe: {', '.join(watchlist)}\n"
         "- You MUST justify every action with a specific thesis\n"
         "- If no good opportunities exist, it's OK to HOLD (empty actions list)\n\n"
+        "DATA INTEGRITY:\n"
+        "- ONLY reference data explicitly provided in the market analysis and constraints below.\n"
+        "- Do NOT fabricate or assume any technical indicators, IV levels, analyst targets, "
+        "or fundamentals that are not in the data. If a metric is missing, skip it.\n\n"
+        "PORTFOLIO HYGIENE (address BEFORE new trades):\n"
+        "- Zombie positions: any position worth < $10 or < 0.1% of portfolio should be "
+        "SOLD immediately regardless of P/L — the fee to close now is less than the drag "
+        "of holding dead weight.\n"
+        "- Overconcentration: if any position exceeds 20% of portfolio, consider trimming "
+        "it first — especially winners where you can lock in profit.\n"
+        "- Pending sell proceeds: if you SELL in this cycle, that cash becomes available "
+        "for BUYs in this same cycle. Plan sell-then-buy sequences.\n\n"
         "SYMBOL DISCOVERY:\n"
         "- In 'suggest_symbols' list up to 5 tickers you want to analyse next cycle.\n"
         "- Use this for any stock, ETF, or asset NOT currently in the universe that\n"
@@ -208,8 +224,14 @@ def build_pass2_messages(
     buying_power = max(0, portfolio.cash - portfolio.total_value * min_cash_pct / 100)
 
     if buying_power <= 0:
+        # Show how much could be freed by selling
+        total_sellable = sum(p.market_value for p in portfolio.positions)
         system_prompt += (
-            "\n⚠ HARD CONSTRAINT: buying power is $0. Do NOT propose any BUY actions.\n"
+            f"\n⚠ HARD CONSTRAINT: buying power is $0 (cash ${portfolio.cash:,.2f} "
+            f"≤ ${portfolio.total_value * min_cash_pct / 100:,.2f} reserve).\n"
+            f"However, you CAN sell positions first to free up cash. "
+            f"Total sellable: ${total_sellable:,.2f}. "
+            f"Plan: SELL first, then BUY with freed cash in the same cycle.\n"
         )
 
     system_prompt += (
@@ -250,14 +272,27 @@ def build_pass2_messages(
 
     constraints_lines.append(f"Max position: {max_position_pct}% = ${max_position_usd:,.0f}")
     constraints_lines.append("")
+
+    # Flag zombie positions and overconcentration
+    zombies = [p for p in portfolio.positions if p.market_value < 10]
+    concentrated = [p for p in portfolio.positions if p.weight_pct > max_position_pct]
+    if zombies:
+        syms = ", ".join(f"{p.symbol} (${p.market_value:.2f})" for p in zombies)
+        constraints_lines.append(f"⚠ ZOMBIE POSITIONS (sell immediately): {syms}")
+    if concentrated:
+        syms = ", ".join(f"{p.symbol} ({p.weight_pct:.1f}%)" for p in concentrated)
+        constraints_lines.append(f"⚠ OVERCONCENTRATED (consider trimming): {syms}")
+    constraints_lines.append("")
     constraints_lines.append("Per-symbol room:")
 
     for p in sorted(portfolio.positions, key=lambda x: x.market_value, reverse=True):
         room = max(0, max_position_usd - p.market_value)
         buy_room = min(room, buying_power)
         status = "AT MAX" if room <= 0 else f"BUY up to ${buy_room:,.0f}"
+        zombie_tag = " [ZOMBIE — sell]" if p.market_value < 10 else ""
+        over_tag = " [OVERWEIGHT — trim]" if p.weight_pct > max_position_pct else ""
         constraints_lines.append(
-            f"  {p.symbol}: {p.weight_pct:.1f}% | {status} | SELL up to ${p.market_value:,.0f}"
+            f"  {p.symbol}: {p.weight_pct:.1f}%{zombie_tag}{over_tag} | {status} | SELL up to ${p.market_value:,.0f}"
         )
 
     # Watchlist symbols without positions

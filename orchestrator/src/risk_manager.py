@@ -117,16 +117,44 @@ class RiskManager:
                 )
 
         # 3. Validate each model action
-        # Skip LLM sells for symbols already covered by forced stop-losses
+        # Process SELLs first so freed cash is available for BUYs
         forced_sell_symbols = {a.symbol for a in result.forced_actions if a.type == "SELL"}
+        sells = [a for a in decision.actions if a.type == "SELL" and a.symbol not in forced_sell_symbols]
+        buys = [a for a in decision.actions if a.type == "BUY"]
+        skipped_sells = [a for a in decision.actions if a.type == "SELL" and a.symbol in forced_sell_symbols]
+        for action in skipped_sells:
+            result.modifications.append(
+                f"SKIPPED {action.type} {action.symbol}: already covered by forced stop-loss"
+            )
+
         validated = []
-        for action in decision.actions:
-            if action.type == "SELL" and action.symbol in forced_sell_symbols:
-                result.modifications.append(
-                    f"SKIPPED {action.type} {action.symbol}: already covered by forced stop-loss"
-                )
-                continue
+        # Track cash freed by approved sells (including forced) for buy validation
+        freed_cash = sum(a.amount_usd for a in result.forced_actions if a.type == "SELL")
+        for action in sells:
             check = self._validate_action(action, portfolio, quotes, order_history)
+            if check.approved:
+                validated.append(check)
+                freed_cash += check.action.amount_usd
+            else:
+                result.rejected_actions.append(check)
+                result.modifications.append(
+                    f"REJECTED {action.type} {action.symbol} ${action.amount_usd:.0f}: "
+                    f"{check.rejection_reason}"
+                )
+
+        # Validate BUYs with adjusted portfolio (cash + freed_cash from sells)
+        if freed_cash > 0:
+            # Create adjusted portfolio snapshot for buy validation
+            adjusted_portfolio = portfolio.with_extra_cash(freed_cash)
+            result.warnings.append(
+                f"Sell-then-buy: ${freed_cash:,.0f} freed from sells, "
+                f"effective buying power: ${max(0, adjusted_portfolio.cash - adjusted_portfolio.total_value * self.min_cash_pct / 100):,.0f}"
+            )
+        else:
+            adjusted_portfolio = portfolio
+
+        for action in buys:
+            check = self._validate_action(action, adjusted_portfolio, quotes, order_history)
             if check.approved:
                 validated.append(check)
             else:

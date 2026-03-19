@@ -56,6 +56,21 @@ class PortfolioState:
                 return p
         return None
 
+    def with_extra_cash(self, extra: float) -> "PortfolioState":
+        """Return a copy with extra cash (e.g. from pending sells)."""
+        return PortfolioState(
+            account_id=self.account_id,
+            account_name=self.account_name,
+            total_value=self.total_value,
+            cash=self.cash + extra,
+            invested=self.invested,
+            positions=self.positions,
+            total_pl=self.total_pl,
+            total_pl_pct=self.total_pl_pct,
+            sector_weights=self.sector_weights,
+            timestamp=self.timestamp,
+        )
+
     def to_prompt_text(self) -> str:
         """Format portfolio state for LLM prompt."""
         lines = [
