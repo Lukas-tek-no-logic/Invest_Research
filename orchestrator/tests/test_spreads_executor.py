@@ -191,7 +191,8 @@ class TestSpreadsExecutorUpdates:
     @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
     def test_update_credit_spread(self, mock_price):
         """Credit spread: P&L = (|entry_credit| - current_value) * contracts * 100."""
-        mock_price.return_value = 1.00  # current sell leg price
+        # Two-leg spread: buy_price=2.0, sell_price=1.0 → current_value = 2.0 - 1.0 = 1.0
+        mock_price.side_effect = [2.0, 1.0]
         executor, _, mock_tracker = _make_executor()
 
         # entry_debit=-2.0 means credit of $2.00 received
