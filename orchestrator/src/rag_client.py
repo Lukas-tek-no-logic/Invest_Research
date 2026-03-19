@@ -88,9 +88,10 @@ class RagClient:
                 return []
         return results
 
-    def _doc_id(self, text: str, source: str) -> str:
-        """Deterministic ID for dedup."""
-        return hashlib.md5(f"{source}:{text[:200]}".encode()).hexdigest()
+    def _doc_id(self, text: str, source: str) -> int:
+        """Deterministic integer ID for dedup (Qdrant needs int or UUID)."""
+        h = hashlib.md5(f"{source}:{text[:200]}".encode()).hexdigest()
+        return int(h[:16], 16)  # 64-bit int from first 16 hex chars
 
     def store_documents(
         self,
@@ -251,14 +252,15 @@ class RagClient:
                     ]
                 )
 
-            results = client.search(
+            from qdrant_client.models import Query
+            response = client.query_points(
                 collection_name=COLLECTION_NAME,
-                query_vector=embeddings[0],
+                query=embeddings[0],
                 query_filter=search_filter,
                 limit=top_k,
             )
             docs = []
-            for r in results:
+            for r in response.points:
                 payload = r.payload or {}
                 docs.append({
                     "text": payload.get("text", ""),
