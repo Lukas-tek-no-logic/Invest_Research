@@ -152,7 +152,7 @@ class Orchestrator:
                 # Re-read positions after update (fresh P/L)
                 active = tracker.get_active_positions(key)
 
-                # Check for take-profit and auto-close triggers
+                # Check for take-profit, auto-close, and near-ATM danger triggers
                 closes_needed = []
                 for pos in active:
                     captured = pos.profit_captured_pct
@@ -172,6 +172,25 @@ class Orchestrator:
                             symbol=pos.symbol,
                             dte=pos.dte,
                         )
+                    elif pos.spread_type == "CASH_SECURED_PUT" and pos.dte is not None and pos.dte < 14:
+                        # Near-ATM danger: CSP within 2% of strike with < 14 DTE
+                        try:
+                            stock_price = self.market_data.get_current_price(pos.symbol)
+                            if stock_price and pos.sell_strike > 0:
+                                margin_pct = (stock_price - pos.sell_strike) / pos.sell_strike * 100
+                                if margin_pct < 2.0:
+                                    closes_needed.append(pos)
+                                    logger.warning(
+                                        "maintenance_near_atm_close",
+                                        account=account_name,
+                                        symbol=pos.symbol,
+                                        strike=pos.sell_strike,
+                                        stock_price=stock_price,
+                                        margin_pct=round(margin_pct, 2),
+                                        dte=pos.dte,
+                                    )
+                        except Exception:
+                            pass
 
                 if closes_needed:
                     from .options.decision_parser import WheelAction

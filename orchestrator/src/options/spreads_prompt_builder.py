@@ -143,7 +143,11 @@ def build_spreads_pass2_messages(
         "  - Prefer debit spreads (bull calls, bear puts) in low-IV with clear direction.\n"
         "  - Avoid spreads within 5 trading days of earnings.\n"
         f"  - Max spread width: ${max_width} between strikes.\n"
-        "  - Be selective - quality over quantity."
+        "  - Be selective - quality over quantity.\n"
+        "  - LIQUIDITY REQUIREMENT: Only trade options on stocks with avg daily volume > 500K shares.\n"
+        "    Small-cap / micro-cap names (< $1B market cap) often have no usable options chains.\n"
+        "    Prefer: AAPL, NVDA, TSLA, MSFT, AMZN, META, SPY, QQQ, AMD, GOOGL, BAC, JPM, XOM.\n"
+        "    Avoid: YSS, SM, PL, SEDG, KLAR, GSIW, and any name you haven't seen liquid chains for."
     )
 
     # Build watchlist with prices and max loss estimates
