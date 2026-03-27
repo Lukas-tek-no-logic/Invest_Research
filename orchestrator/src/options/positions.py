@@ -78,6 +78,19 @@ class OptionsPosition:
         return None
 
 
+@dataclass
+class OptionLeg:
+    """A single leg of a multi-leg spread (stored in options_legs table)."""
+    position_id: int
+    leg_index: int
+    option_type: str      # 'call' or 'put'
+    side: str             # 'buy' or 'sell'
+    strike: float
+    premium: float = 0.0
+    contract_symbol: str = ""
+    id: int = 0
+
+
 class OptionsPositionTracker:
     """CRUD operations for options_positions in SQLite."""
 
@@ -126,6 +139,20 @@ class OptionsPositionTracker:
                     ghostfolio_close_order_id TEXT,
 
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            # Multi-leg storage for iron condors and other 4-leg spreads
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS options_legs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    position_id INTEGER NOT NULL REFERENCES options_positions(id),
+                    leg_index INTEGER NOT NULL,
+                    option_type TEXT NOT NULL,
+                    side TEXT NOT NULL,
+                    strike REAL NOT NULL,
+                    premium REAL DEFAULT 0,
+                    contract_symbol TEXT,
+                    UNIQUE(position_id, leg_index)
                 )
             """)
             # Wheel state columns (added incrementally)
@@ -190,6 +217,42 @@ class OptionsPositionTracker:
             expiration=expiration_date, dte=dte,
         )
         return pos_id
+
+    def save_legs(self, position_id: int, legs: list[dict]) -> None:
+        """Store all legs of a multi-leg spread. Each dict: option_type, side, strike, premium, contract_symbol."""
+        with sqlite3.connect(self.db_path) as conn:
+            for idx, leg in enumerate(legs):
+                conn.execute(
+                    """INSERT OR REPLACE INTO options_legs
+                    (position_id, leg_index, option_type, side, strike, premium, contract_symbol)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        position_id, idx, leg["option_type"], leg["side"],
+                        leg["strike"], leg.get("premium", 0), leg.get("contract_symbol", ""),
+                    ),
+                )
+        logger.info("options_legs_saved", position_id=position_id, count=len(legs))
+
+    def get_legs(self, position_id: int) -> list[OptionLeg]:
+        """Retrieve all legs for a position, ordered by leg_index."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    "SELECT * FROM options_legs WHERE position_id=? ORDER BY leg_index",
+                    (position_id,),
+                ).fetchall()
+            return [
+                OptionLeg(
+                    id=r["id"], position_id=r["position_id"], leg_index=r["leg_index"],
+                    option_type=r["option_type"], side=r["side"], strike=r["strike"],
+                    premium=r.get("premium", 0) or 0, contract_symbol=r.get("contract_symbol", ""),
+                )
+                for r in rows
+            ]
+        except Exception as e:
+            logger.warning("get_legs_failed", position_id=position_id, error=str(e))
+            return []
 
     def update_position(
         self,

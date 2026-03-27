@@ -15,6 +15,7 @@ def _make_executor(dry_run=False):
     mock_tracker = MagicMock()
     mock_tracker.open_position.return_value = 42  # new position ID
     mock_tracker.close_position.return_value = 15.50  # realized P&L
+    mock_tracker.get_legs.return_value = []  # no multi-leg data (legacy path)
 
     executor = SpreadsExecutor(
         ghostfolio=mock_ghostfolio,

@@ -198,6 +198,18 @@ class SpreadsExecutor:
                 ghostfolio_order_id=ghostfolio_order_id,
             )
 
+            # Store ALL legs for multi-leg spreads (critical for iron condors)
+            self.tracker.save_legs(pos_id, [
+                {
+                    "option_type": l.option_type,
+                    "side": l.side,
+                    "strike": l.strike,
+                    "premium": l.premium,
+                    "contract_symbol": l.contract_symbol,
+                }
+                for l in spread.legs
+            ])
+
             # Compute initial net greeks from legs
             net_delta = sum(
                 l.delta * (1 if l.side == "buy" else -1) * 100 * action.contracts
@@ -243,13 +255,26 @@ class SpreadsExecutor:
     def _close_position(self, pos: OptionsPosition, reason: str) -> SpreadsTradeResult:
         """Close an existing spread position."""
         try:
-            # Estimate current spread value from the sell leg
-            close_value = get_current_option_price(
-                pos.symbol,
-                pos.sell_option_type,
-                pos.sell_strike,
-                pos.expiration_date,
-            )
+            # Price all legs for accurate close value (critical for iron condors)
+            all_legs = self.tracker.get_legs(pos.id)
+            if all_legs:
+                net_value = 0.0
+                all_priced = True
+                for leg in all_legs:
+                    leg_price = get_current_option_price(
+                        pos.symbol, leg.option_type, leg.strike, pos.expiration_date,
+                    )
+                    if leg_price is None:
+                        all_priced = False
+                        break
+                    sign = 1 if leg.side == "buy" else -1
+                    net_value += leg_price * sign
+                close_value = round(net_value, 2) if all_priced else None
+            else:
+                # Legacy: single sell leg pricing
+                close_value = get_current_option_price(
+                    pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
+                )
             if close_value is None:
                 close_value = pos.current_value or abs(pos.entry_debit or 0)
 
@@ -312,24 +337,36 @@ class SpreadsExecutor:
                     position_id=pos.id, success=True,
                 )
 
-            # For two-legged spreads, compute net spread value = buy_leg - sell_leg.
-            # For single-leg positions (CSP/CC stored here), buy_strike == 0 so we
-            # fall back to sell-leg-only pricing.
+            # Price all legs from options_legs table (handles iron condors correctly).
+            # Falls back to legacy 2-leg pricing if no legs stored.
             entry_debit = pos.entry_debit or 0
-            has_two_legs = (pos.buy_strike or 0) > 0
+            all_legs = self.tracker.get_legs(pos.id)
 
-            if has_two_legs:
+            if all_legs:
+                # Multi-leg pricing: net value = Σ(leg_price * sign)
+                # buy legs are assets (positive), sell legs are liabilities (negative)
+                net_value = 0.0
+                for leg in all_legs:
+                    leg_price = get_current_option_price(
+                        pos.symbol, leg.option_type, leg.strike, pos.expiration_date,
+                    )
+                    if leg_price is None:
+                        return SpreadsTradeResult(
+                            action="UPDATE", symbol=pos.symbol,
+                            spread_type=pos.spread_type,
+                            position_id=pos.id, success=False,
+                            error=f"Could not fetch price for {leg.option_type} {leg.strike}",
+                        )
+                    sign = 1 if leg.side == "buy" else -1
+                    net_value += leg_price * sign
+                current_value = round(net_value, 2)
+            elif (pos.buy_strike or 0) > 0:
+                # Legacy 2-leg fallback (positions opened before options_legs table)
                 buy_price = get_current_option_price(
-                    pos.symbol,
-                    pos.buy_option_type,
-                    pos.buy_strike,
-                    pos.expiration_date,
+                    pos.symbol, pos.buy_option_type, pos.buy_strike, pos.expiration_date,
                 )
                 sell_price = get_current_option_price(
-                    pos.symbol,
-                    pos.sell_option_type,
-                    pos.sell_strike,
-                    pos.expiration_date,
+                    pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
                 )
                 if buy_price is None or sell_price is None:
                     return SpreadsTradeResult(
@@ -342,10 +379,7 @@ class SpreadsExecutor:
             else:
                 # Single-leg (CSP/CC): sell leg only
                 current_value = get_current_option_price(
-                    pos.symbol,
-                    pos.sell_option_type,
-                    pos.sell_strike,
-                    pos.expiration_date,
+                    pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
                 )
                 if current_value is None:
                     return SpreadsTradeResult(

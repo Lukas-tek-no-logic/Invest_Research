@@ -27,6 +27,9 @@ class TechnicalSignals:
     bb_lower: float | None = None
     volume_ratio: float | None = None  # current volume / 20-day avg
     atr_14: float | None = None        # Average True Range 14-day
+    adx_14: float | None = None        # Average Directional Index 14-day
+    support_level: float | None = None  # 20-period swing low
+    resistance_level: float | None = None  # 20-period swing high
     price: float | None = None
 
     def to_summary(self) -> dict:
@@ -52,6 +55,12 @@ class TechnicalSignals:
         if self.atr_14 is not None and self.price:
             signals["ATR14"] = round(self.atr_14, 2)
             signals["ATR14_pct"] = round(self.atr_14 / self.price * 100, 2)
+        if self.adx_14 is not None:
+            signals["ADX14"] = round(self.adx_14, 2)
+        if self.support_level is not None:
+            signals["support"] = round(self.support_level, 2)
+        if self.resistance_level is not None:
+            signals["resistance"] = round(self.resistance_level, 2)
         if self.price is not None:
             signals["price"] = round(self.price, 2)
 
@@ -77,6 +86,11 @@ class TechnicalSignals:
                 interpretations.append("MACD bullish")
             else:
                 interpretations.append("MACD bearish")
+        if self.adx_14 is not None:
+            if self.adx_14 > 25:
+                interpretations.append("Strong trend (ADX)")
+            else:
+                interpretations.append("Range-bound (ADX)")
 
         signals["interpretation"] = ", ".join(interpretations) if interpretations else "Neutral"
         return signals
@@ -141,6 +155,20 @@ def compute_indicators(df: pd.DataFrame, symbol: str) -> TechnicalSignals:
         atr_val = atr.average_true_range()
         if not atr_val.empty and pd.notna(atr_val.iloc[-1]):
             signals.atr_14 = float(atr_val.iloc[-1])
+
+    # ADX (Average Directional Index)
+    if len(df) >= 28:  # ADX needs at least 2×window rows
+        try:
+            adx = ta.trend.adx(high, low, close, window=14)
+            if not adx.empty and pd.notna(adx.iloc[-1]):
+                signals.adx_14 = float(adx.iloc[-1])
+        except Exception:
+            pass  # ADX may fail on very thin data
+
+    # Support / Resistance (20-period swing low/high)
+    if len(df) >= 20:
+        signals.support_level = float(low.tail(20).min())
+        signals.resistance_level = float(high.tail(20).max())
 
     # Volume ratio
     if len(volume) >= 20:
