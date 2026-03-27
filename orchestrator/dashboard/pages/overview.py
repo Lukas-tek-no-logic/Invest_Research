@@ -209,9 +209,8 @@ _options_pl_cache: dict[str, float] = {
 }
 
 # Calculate total portfolio value across all trading accounts.
-# For all accounts (including options) use live Ghostfolio cash balance.
-# Options accounts: total = Ghostfolio balance (premiums received/debits paid already
-# reflected there after today's fix) + tiny synthetic holdings value.
+# Options accounts use cash-only from Ghostfolio (synthetic option assets in Ghostfolio
+# have mismatched BUY/SELL symbols and create phantom holdings — exclude securities).
 # Fallback for options: initial_budget + realized_pl if Ghostfolio data unavailable.
 initial_budget = config.get("defaults", {}).get("initial_budget", 10000)
 _total_value = 0.0
@@ -220,12 +219,15 @@ for _key, _acct in trading_accounts.items():
     _acct_budget = float(_acct.get("initial_budget", initial_budget))
     _aid = _acct.get("ghostfolio_account_id", "")
     _live = _live_values.get(_aid, {})
-    if _live.get("total"):
-        _total_value += _live["total"]
+    if _acct.get("strategy") in _OPTIONS_STRATEGIES:
+        # Options: use cash only (securities are phantom from UUID/symbol mismatch)
+        if _live.get("cash") is not None:
+            _total_value += _live["cash"]
+        else:
+            _total_value += _acct_budget + _options_pl_cache.get(_key, 0.0)
         _total_accounts += 1
-    elif _acct.get("strategy") in _OPTIONS_STRATEGIES:
-        # Ghostfolio unavailable — fall back to initial + realized P/L
-        _total_value += _acct_budget + _options_pl_cache.get(_key, 0.0)
+    elif _live.get("total"):
+        _total_value += _live["total"]
         _total_accounts += 1
 
 # Title row with total balance
@@ -303,15 +305,17 @@ for strategy_key in _GROUP_ORDER:
             live = _live_values.get(acct_id, {})
             strategy = acct.get("strategy", "")
             acct_budget = float(acct.get("initial_budget", initial_budget))
-            if live.get("total"):
-                # Use Ghostfolio balance for all accounts (options balance now correct after fix)
+            if strategy in _OPTIONS_STRATEGIES:
+                # Options: use cash only (securities are phantom from UUID/symbol mismatch)
+                if live.get("cash") is not None:
+                    value = live["cash"]
+                else:
+                    realized_pl = _options_pl_cache.get(key, 0.0)
+                    value = acct_budget + realized_pl
+                pl_pct = (value - acct_budget) / acct_budget * 100 if acct_budget else None
+            elif live.get("total"):
                 value = live["total"]
                 pl_pct = (value - acct_budget) / acct_budget * 100 if acct_budget else None
-            elif strategy in _OPTIONS_STRATEGIES:
-                # Ghostfolio unavailable — fall back to initial + realized P/L
-                realized_pl = _options_pl_cache.get(key, 0.0)
-                value = acct_budget + realized_pl
-                pl_pct = (realized_pl / acct_budget * 100) if acct_budget else None
             else:
                 value = latest.get("portfolio_value")
                 pl_pct = latest.get("portfolio_pl_pct")
