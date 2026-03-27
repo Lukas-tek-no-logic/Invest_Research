@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -93,6 +94,30 @@ class Orchestrator:
     def _load_config(self) -> None:
         with open(self.config_path) as f:
             self.config = yaml.safe_load(f)
+
+    # ── Rebalance state (for rules engine timing gates) ──────────────────
+
+    _REBALANCE_STATE_PATH = Path("data/rebalance_state.json")
+
+    def _load_rebalance_date(self, account_key: str) -> str | None:
+        try:
+            if self._REBALANCE_STATE_PATH.exists():
+                state = json.loads(self._REBALANCE_STATE_PATH.read_text())
+                return state.get(account_key)
+        except Exception:
+            pass
+        return None
+
+    def _save_rebalance_date(self, account_key: str, dt: datetime | None = None) -> None:
+        try:
+            self._REBALANCE_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            state = {}
+            if self._REBALANCE_STATE_PATH.exists():
+                state = json.loads(self._REBALANCE_STATE_PATH.read_text())
+            state[account_key] = (dt or datetime.now()).isoformat()
+            self._REBALANCE_STATE_PATH.write_text(json.dumps(state, indent=2))
+        except Exception as e:
+            logger.warning("rebalance_state_save_failed", error=str(e))
 
     def run_options_maintenance(self) -> None:
         """Daily maintenance: update P/L, check take-profit, handle expirations.
@@ -777,6 +802,7 @@ class Orchestrator:
             # Fundamental data: earnings history, analyst consensus, growth metrics
             # Priority: held positions (for stay/exit) + top watchlist symbols
             fundamentals_text = ""
+            fundamentals: dict = {}
             try:
                 held_symbols = {p.symbol for p in portfolio.positions}
                 fundamentals = get_fundamentals_batch(
@@ -809,132 +835,213 @@ class Orchestrator:
             except Exception as e:
                 logger.warning("research_brief_load_failed", error=str(e))
 
-            # ===== PHASE 2: LLM PASS 1 - ANALYSIS =====
-            logger.info("phase2_llm_analysis", account=account_name, model=model)
+            # ===== PHASE 2-3: DECISION (rules engine OR LLM) =====
+            decision_mode = acct.get("decision_mode", "llm")
 
-            pass1_messages = build_pass1_messages(
-                portfolio=portfolio,
-                market_data=market_data,
-                technical_signals=tech_signals,
-                news_text=news_text,
-                decision_history=history_text,
-                strategy_config=acct,
-                earnings_text=earnings_text,
-                fundamentals_text=fundamentals_text,
-                research_brief=research_brief,
-            )
+            if decision_mode == "rules":
+                # ── Rules Engine path (1 LLM call for review) ──
+                from .rules_engine import RulesEngine
+                from .llm_review import build_review_messages, parse_review, apply_vetoes
 
-            analysis_raw = self.llm.chat_json(
-                messages=pass1_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.7,
-            )
-            analysis = parse_analysis(analysis_raw)
-            logger.info(
-                "analysis_complete",
-                regime=analysis.market_regime,
-                opportunities=len(analysis.opportunities),
-            )
+                logger.info("phase2_rules_engine", account=account_name, strategy=acct.get("strategy"))
 
-            # ===== PHASE 2.5: RAG CONTEXT + BELIEFS =====
-            # Store news and research in Qdrant for future retrieval
-            rag_context = ""
-            try:
-                if news_items:
-                    self.rag.store_news(news_items)
-                if research_brief:
-                    self.rag.store_research_brief(research_brief)
-                # HyDE retrieval: use portfolio + regime as query
-                query = (
-                    f"Account: {account_name}, Strategy: {acct.get('strategy', '')}\n"
-                    f"Regime: {analysis.market_regime}\n"
-                    f"Portfolio P/L: {portfolio.total_pl_pct:+.1f}%, Cash: {portfolio.cash_pct:.0f}%"
+                # Fetch raw earnings dates for rules engine
+                try:
+                    earnings_dates = self.market_data.get_upcoming_earnings(watchlist, days=7)
+                except Exception:
+                    earnings_dates = {}
+
+                engine = RulesEngine()
+                proposal = engine.propose(
+                    strategy=acct.get("strategy", ""),
+                    portfolio=portfolio,
+                    market_data=market_data,
+                    technical_signals=tech_signals,
+                    fundamentals=fundamentals,
+                    quotes=quotes,
+                    earnings_data=earnings_dates,
+                    risk_profile=risk_profile,
+                    rules_params=acct.get("rules_params", {}),
+                    last_rebalance_date=self._load_rebalance_date(account_key),
                 )
-                held_symbols = [p.symbol for p in portfolio.positions]
-                rag_docs = self.rag.hyde_retrieve(query, symbols=held_symbols + watchlist[:10], model=model)
-                rag_context = self.rag.format_for_prompt(rag_docs)
-            except Exception as e:
-                logger.warning("rag_context_failed", error=str(e))
 
-            # Load learned beliefs from self-critique
-            beliefs: list[str] = []
-            try:
-                belief_data = self.reflection.load_beliefs(account_key)
-                beliefs = belief_data.get("beliefs", [])
-                if beliefs:
-                    logger.info("beliefs_loaded", account=account_key, count=len(beliefs))
-            except Exception:
-                pass
+                analysis_raw = {
+                    "market_regime": "RULES_ENGINE",
+                    "scored_universe": [
+                        {"symbol": s.symbol, "score": s.score, "signal": s.signal}
+                        for s in proposal.scored_universe[:10]
+                    ],
+                }
 
-            # ===== PHASE 3: BULL vs BEAR DEBATE + SYNTHESIS =====
-            logger.info("phase3_bull_bear_debate", account=account_name, model=model)
+                if proposal.actions:
+                    # Build VIX/TNX context for review
+                    vix_data = market_data.get("^VIX", {})
+                    tnx_data = market_data.get("^TNX", {})
+                    mkt_ctx = {
+                        "vix": vix_data.get("price", "N/A"),
+                        "tnx": tnx_data.get("price", "N/A"),
+                    }
+                    review_msgs = build_review_messages(
+                        proposals=proposal.actions,
+                        score_breakdowns=proposal.scored_universe,
+                        portfolio=portfolio,
+                        market_context=mkt_ctx,
+                        strategy=acct.get("strategy", ""),
+                    )
+                    pass2_messages = review_msgs
 
-            # Bull case
-            bull_messages = build_bull_bear_messages(
-                analysis_json=analysis_raw,
-                portfolio=portfolio,
-                strategy_config=acct,
-                risk_profile=risk_profile,
-                side="bull",
-                beliefs=beliefs,
-                rag_context=rag_context,
-            )
-            bull_raw = self.llm.chat_json(
-                messages=bull_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.6,
-            )
-            logger.info("bull_case_complete", actions=len(bull_raw.get("actions", [])))
+                    try:
+                        review_raw = self.llm.chat_json(
+                            messages=review_msgs, model=model,
+                            fallback_model=fallback, temperature=0.3,
+                        )
+                        verdicts = parse_review(review_raw)
+                        decision = apply_vetoes(
+                            proposal.actions, verdicts,
+                            portfolio_outlook=review_raw.get("portfolio_outlook", "NEUTRAL"),
+                            confidence=review_raw.get("confidence", 0.7),
+                        )
+                        decision_raw = review_raw
+                    except Exception as e:
+                        logger.warning("llm_review_failed_approving_all", error=str(e))
+                        decision = DecisionResult(
+                            reasoning=f"Rules engine: {len(proposal.actions)} trades (LLM review failed)",
+                            actions=proposal.actions,
+                            portfolio_outlook="NEUTRAL",
+                            confidence=0.6,
+                        )
+                        decision_raw = {}
+                else:
+                    decision = DecisionResult(
+                        reasoning=proposal.hold_reason or "No trades proposed by rules engine",
+                        actions=[],
+                        portfolio_outlook="NEUTRAL",
+                        confidence=0.8,
+                    )
+                    decision_raw = {}
+                    pass2_messages = []
 
-            # Bear case
-            bear_messages = build_bull_bear_messages(
-                analysis_json=analysis_raw,
-                portfolio=portfolio,
-                strategy_config=acct,
-                risk_profile=risk_profile,
-                side="bear",
-                beliefs=beliefs,
-                rag_context=rag_context,
-            )
-            bear_raw = self.llm.chat_json(
-                messages=bear_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.6,
-            )
-            logger.info("bear_case_complete", actions=len(bear_raw.get("actions", [])))
+                logger.info(
+                    "rules_decision_complete",
+                    proposed=len(proposal.actions),
+                    approved=len(decision.actions),
+                    hold_reason=proposal.hold_reason,
+                    rebalance=proposal.rebalance_triggered,
+                )
 
-            # Synthesis: CIO weighs both cases
-            synthesis_messages = build_synthesis_messages(
-                analysis_json=analysis_raw,
-                bull_case=bull_raw,
-                bear_case=bear_raw,
-                portfolio=portfolio,
-                strategy_config=acct,
-                risk_profile=risk_profile,
-            )
-            decision_raw = self.llm.chat_json(
-                messages=synthesis_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.4,
-            )
-            # Keep pass2_messages for audit (use synthesis as the "pass2")
-            pass2_messages = synthesis_messages
-            decision = parse_decision(decision_raw)
-            logger.info(
-                "synthesis_complete",
-                actions=len(decision.actions),
-                outlook=decision.portfolio_outlook,
-                confidence=decision.confidence,
-                suggest_symbols=decision.suggest_symbols,
-            )
+            else:
+                # ── Legacy LLM path (4 calls) ──
+                logger.info("phase2_llm_analysis", account=account_name, model=model)
 
-            # Save LLM's symbol suggestions for the next cycle
-            if decision.suggest_symbols:
-                watchlist_mgr.save_suggestions(decision.suggest_symbols)
+                pass1_messages = build_pass1_messages(
+                    portfolio=portfolio,
+                    market_data=market_data,
+                    technical_signals=tech_signals,
+                    news_text=news_text,
+                    decision_history=history_text,
+                    strategy_config=acct,
+                    earnings_text=earnings_text,
+                    fundamentals_text=fundamentals_text,
+                    research_brief=research_brief,
+                )
+
+                analysis_raw = self.llm.chat_json(
+                    messages=pass1_messages,
+                    model=model,
+                    fallback_model=fallback,
+                    temperature=0.7,
+                )
+                analysis = parse_analysis(analysis_raw)
+                logger.info(
+                    "analysis_complete",
+                    regime=analysis.market_regime,
+                    opportunities=len(analysis.opportunities),
+                )
+
+                # ===== PHASE 2.5: RAG CONTEXT + BELIEFS =====
+                rag_context = ""
+                try:
+                    if news_items:
+                        self.rag.store_news(news_items)
+                    if research_brief:
+                        self.rag.store_research_brief(research_brief)
+                    query = (
+                        f"Account: {account_name}, Strategy: {acct.get('strategy', '')}\n"
+                        f"Regime: {analysis.market_regime}\n"
+                        f"Portfolio P/L: {portfolio.total_pl_pct:+.1f}%, Cash: {portfolio.cash_pct:.0f}%"
+                    )
+                    held_symbols = [p.symbol for p in portfolio.positions]
+                    rag_docs = self.rag.hyde_retrieve(query, symbols=held_symbols + watchlist[:10], model=model)
+                    rag_context = self.rag.format_for_prompt(rag_docs)
+                except Exception as e:
+                    logger.warning("rag_context_failed", error=str(e))
+
+                beliefs: list[str] = []
+                try:
+                    belief_data = self.reflection.load_beliefs(account_key)
+                    beliefs = belief_data.get("beliefs", [])
+                    if beliefs:
+                        logger.info("beliefs_loaded", account=account_key, count=len(beliefs))
+                except Exception:
+                    pass
+
+                # ===== PHASE 3: BULL vs BEAR DEBATE + SYNTHESIS =====
+                logger.info("phase3_bull_bear_debate", account=account_name, model=model)
+
+                bull_messages = build_bull_bear_messages(
+                    analysis_json=analysis_raw,
+                    portfolio=portfolio,
+                    strategy_config=acct,
+                    risk_profile=risk_profile,
+                    side="bull",
+                    beliefs=beliefs,
+                    rag_context=rag_context,
+                )
+                bull_raw = self.llm.chat_json(
+                    messages=bull_messages, model=model,
+                    fallback_model=fallback, temperature=0.6,
+                )
+                logger.info("bull_case_complete", actions=len(bull_raw.get("actions", [])))
+
+                bear_messages = build_bull_bear_messages(
+                    analysis_json=analysis_raw,
+                    portfolio=portfolio,
+                    strategy_config=acct,
+                    risk_profile=risk_profile,
+                    side="bear",
+                    beliefs=beliefs,
+                    rag_context=rag_context,
+                )
+                bear_raw = self.llm.chat_json(
+                    messages=bear_messages, model=model,
+                    fallback_model=fallback, temperature=0.6,
+                )
+                logger.info("bear_case_complete", actions=len(bear_raw.get("actions", [])))
+
+                synthesis_messages = build_synthesis_messages(
+                    analysis_json=analysis_raw,
+                    bull_case=bull_raw,
+                    bear_case=bear_raw,
+                    portfolio=portfolio,
+                    strategy_config=acct,
+                    risk_profile=risk_profile,
+                )
+                decision_raw = self.llm.chat_json(
+                    messages=synthesis_messages, model=model,
+                    fallback_model=fallback, temperature=0.4,
+                )
+                pass2_messages = synthesis_messages
+                decision = parse_decision(decision_raw)
+                logger.info(
+                    "synthesis_complete",
+                    actions=len(decision.actions),
+                    outlook=decision.portfolio_outlook,
+                    confidence=decision.confidence,
+                    suggest_symbols=decision.suggest_symbols,
+                )
+
+                if decision.suggest_symbols:
+                    watchlist_mgr.save_suggestions(decision.suggest_symbols)
 
             # ===== PHASE 4: RISK VALIDATION =====
             logger.info("phase4_risk_validation", account=account_name)
@@ -1015,6 +1122,10 @@ class Orchestrator:
                     logger.warning("order_verification", warning=vw)
             else:
                 logger.info("phase5_no_trades", account=account_name, reason="No actions to execute")
+
+            # Save rebalance date for rules engine timing gates
+            if decision_mode == "rules" and any(t.get("success") for t in executed_trades):
+                self._save_rebalance_date(account_key)
 
             # Estimate portfolio state after trades from executed results
             # (Ghostfolio API may not reflect trades immediately)
