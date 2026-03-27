@@ -1321,59 +1321,122 @@ class Orchestrator:
             from .prompt_builder import format_decision_history
             history_text = format_decision_history(history)
 
-            # ===== PHASE 2: LLM PASS 1 - ANALYSIS =====
-            logger.info("spreads_phase2_analysis", model=model)
+            # ===== PHASE 2-3: DECISIONS (rules OR LLM) =====
+            decision_mode = acct.get("decision_mode", "llm")
 
-            pass1_messages = build_spreads_pass1_messages(
-                portfolio=portfolio,
-                market_data=market_data,
-                technical_signals=tech_signals,
-                news_text=news_text,
-                strategy_config=acct,
-                active_positions=active_positions,
-                iv_data=iv_data,
-                portfolio_greeks=portfolio_greeks,
-            )
+            if decision_mode == "rules":
+                # ── Rules Engine for spreads ──
+                from .options.options_rules_engine import score_spread_candidates
+                logger.info("spreads_phase2_rules_engine", account=account_name)
 
-            analysis_raw = self.llm.chat_json(
-                messages=pass1_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.7,
-            )
-            logger.info(
-                "spreads_analysis_complete",
-                regime=analysis_raw.get("market_regime"),
-                iv_regime=analysis_raw.get("iv_regime"),
-            )
+                proposed = score_spread_candidates(
+                    watchlist=watchlist,
+                    iv_data=iv_data,
+                    tech_signals=tech_signals,
+                    market_data=market_data,
+                    active_positions=active_positions,
+                    risk_profile=risk_profile,
+                )
 
-            # ===== PHASE 3: LLM PASS 2 - DECISIONS =====
-            logger.info("spreads_phase3_decisions", model=model)
+                from .options.spreads_decision_parser import SpreadAction
+                actions = [
+                    SpreadAction(type=p["type"], symbol=p["symbol"],
+                                 spread_type=p.get("spread_type", ""),
+                                 contracts=p.get("contracts", 1), reason=p["reason"])
+                    for p in proposed
+                ]
 
-            pass2_messages = build_spreads_pass2_messages(
-                analysis_json=analysis_raw,
-                portfolio=portfolio,
-                strategy_config=acct,
-                risk_profile=risk_profile,
-                active_positions=active_positions,
-                portfolio_greeks=portfolio_greeks,
-                decision_history=history_text,
-                market_data=market_data,
-            )
+                # Optional LLM review
+                if actions and risk_profile.get("llm_review", True):
+                    review_system = (
+                        "You review proposed spread trades. For each: APPROVE or VETO with concrete reason. "
+                        'JSON: {"reviews": [{"symbol": "X", "verdict": "APPROVE|VETO", "reason": "..."}]}'
+                    )
+                    proposals_text = "\n".join(
+                        f"  {a.spread_type.upper()} {a.symbol}: {a.reason}" for a in actions
+                    )
+                    review_msgs = [
+                        {"role": "system", "content": review_system},
+                        {"role": "user", "content": f"Portfolio cash: ${portfolio.cash:,.0f}\n\nPROPOSED:\n{proposals_text}"},
+                    ]
+                    pass2_messages = review_msgs
+                    try:
+                        review_raw = self.llm.chat_json(messages=review_msgs, model=model,
+                                                         fallback_model=fallback, temperature=0.3)
+                        decision_raw = review_raw
+                        vetoed = {r["symbol"] for r in review_raw.get("reviews", [])
+                                  if isinstance(r, dict) and r.get("verdict", "").upper() == "VETO"}
+                        actions = [a for a in actions if a.symbol not in vetoed]
+                        if vetoed:
+                            logger.info("spreads_rules_vetoed", vetoed=vetoed)
+                    except Exception as e:
+                        logger.warning("spreads_llm_review_failed", error=str(e))
+                        decision_raw = {}
+                else:
+                    decision_raw = {}
+                    pass2_messages = []
 
-            decision_raw = self.llm.chat_json(
-                messages=pass2_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.5,
-            )
-            spreads_decision = parse_spreads_decision(decision_raw)
-            logger.info(
-                "spreads_decision_complete",
-                open_new=len(spreads_decision.open_new),
-                closes=len(spreads_decision.close_positions),
-                outlook=spreads_decision.portfolio_outlook,
-            )
+                spreads_decision = parse_spreads_decision({
+                    "actions": [{"type": a.type, "symbol": a.symbol,
+                                 "spread_type": a.spread_type,
+                                 "contracts": a.contracts, "reason": a.reason} for a in actions],
+                    "outlook": "NEUTRAL",
+                    "confidence": 0.7,
+                    "market_comment": f"Rules engine proposed {len(proposed)} spreads, {len(actions)} approved",
+                })
+                analysis_raw = {"market_regime": "RULES_ENGINE"}
+
+                logger.info("spreads_rules_complete", proposed=len(proposed), approved=len(actions))
+
+            else:
+                # ── Legacy LLM path (2 calls) ──
+                logger.info("spreads_phase2_analysis", model=model)
+
+                pass1_messages = build_spreads_pass1_messages(
+                    portfolio=portfolio,
+                    market_data=market_data,
+                    technical_signals=tech_signals,
+                    news_text=news_text,
+                    strategy_config=acct,
+                    active_positions=active_positions,
+                    iv_data=iv_data,
+                    portfolio_greeks=portfolio_greeks,
+                )
+
+                analysis_raw = self.llm.chat_json(
+                    messages=pass1_messages, model=model,
+                    fallback_model=fallback, temperature=0.7,
+                )
+                logger.info(
+                    "spreads_analysis_complete",
+                    regime=analysis_raw.get("market_regime"),
+                    iv_regime=analysis_raw.get("iv_regime"),
+                )
+
+                logger.info("spreads_phase3_decisions", model=model)
+
+                pass2_messages = build_spreads_pass2_messages(
+                    analysis_json=analysis_raw,
+                    portfolio=portfolio,
+                    strategy_config=acct,
+                    risk_profile=risk_profile,
+                    active_positions=active_positions,
+                    portfolio_greeks=portfolio_greeks,
+                    decision_history=history_text,
+                    market_data=market_data,
+                )
+
+                decision_raw = self.llm.chat_json(
+                    messages=pass2_messages, model=model,
+                    fallback_model=fallback, temperature=0.5,
+                )
+                spreads_decision = parse_spreads_decision(decision_raw)
+                logger.info(
+                    "spreads_decision_complete",
+                    open_new=len(spreads_decision.open_new),
+                    closes=len(spreads_decision.close_positions),
+                    outlook=spreads_decision.portfolio_outlook,
+                )
 
             # ===== PHASE 4: RISK VALIDATION =====
             logger.info("spreads_phase4_risk", account=account_name)
@@ -1592,60 +1655,121 @@ class Orchestrator:
             from .prompt_builder import format_decision_history
             history_text = format_decision_history(history)
 
-            # ===== PHASE 2: LLM PASS 1 - ANALYSIS =====
-            logger.info("options_phase2_analysis", model=model)
+            # ===== PHASE 2-3: DECISIONS (rules OR LLM) =====
+            decision_mode = acct.get("decision_mode", "llm")
 
-            pass1_messages = build_options_pass1_messages(
-                portfolio=portfolio,
-                market_data=market_data,
-                technical_signals=tech_signals,
-                news_text=news_text,
-                strategy_config=acct,
-                active_positions=all_positions,
-                iv_data=iv_data,
-                portfolio_greeks=portfolio_greeks,
-            )
+            if decision_mode == "rules":
+                # ── Rules Engine for wheel ──
+                from .options.options_rules_engine import score_wheel_candidates
+                logger.info("options_phase2_rules_engine", account=account_name)
 
-            analysis_raw = self.llm.chat_json(
-                messages=pass1_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.7,
-            )
-            logger.info(
-                "options_analysis_complete",
-                regime=analysis_raw.get("market_regime"),
-                iv_regime=analysis_raw.get("iv_regime"),
-            )
+                proposed = score_wheel_candidates(
+                    watchlist=watchlist,
+                    iv_data=iv_data,
+                    tech_signals=tech_signals,
+                    market_data=market_data,
+                    portfolio_cash=portfolio.cash,
+                    active_positions=active_positions,
+                    risk_profile=risk_profile,
+                )
 
-            # ===== PHASE 3: LLM PASS 2 - DECISIONS =====
-            logger.info("options_phase3_decisions", model=model)
+                # Build WheelDecision from rules output
+                from .options.decision_parser import WheelAction
+                actions = [
+                    WheelAction(type=p["type"], symbol=p["symbol"],
+                                contracts=p.get("contracts", 1), reason=p["reason"])
+                    for p in proposed
+                ]
 
-            pass2_messages = build_options_pass2_messages(
-                analysis_json=analysis_raw,
-                portfolio=portfolio,
-                strategy_config=acct,
-                risk_profile=risk_profile,
-                active_positions=all_positions,
-                portfolio_greeks=portfolio_greeks,
-                decision_history=history_text,
-                market_data=market_data,
-            )
+                # Optional LLM review
+                if actions and risk_profile.get("llm_review", True):
+                    from .llm_review import build_review_messages as _build_review
+                    review_system = (
+                        "You review proposed CSP trades. For each: APPROVE or VETO with concrete reason. "
+                        'JSON: {"reviews": [{"symbol": "X", "verdict": "APPROVE|VETO", "reason": "..."}]}'
+                    )
+                    proposals_text = "\n".join(f"  SELL_CSP {a.symbol}: {a.reason}" for a in actions)
+                    review_msgs = [
+                        {"role": "system", "content": review_system},
+                        {"role": "user", "content": f"Portfolio cash: ${portfolio.cash:,.0f}\n\nPROPOSED:\n{proposals_text}"},
+                    ]
+                    pass2_messages = review_msgs
+                    try:
+                        review_raw = self.llm.chat_json(messages=review_msgs, model=model,
+                                                         fallback_model=fallback, temperature=0.3)
+                        decision_raw = review_raw
+                        vetoed = {r["symbol"] for r in review_raw.get("reviews", [])
+                                  if isinstance(r, dict) and r.get("verdict", "").upper() == "VETO"}
+                        actions = [a for a in actions if a.symbol not in vetoed]
+                        if vetoed:
+                            logger.info("options_rules_vetoed", vetoed=vetoed)
+                    except Exception as e:
+                        logger.warning("options_llm_review_failed", error=str(e))
+                        decision_raw = {}
+                else:
+                    decision_raw = {}
+                    pass2_messages = []
 
-            decision_raw = self.llm.chat_json(
-                messages=pass2_messages,
-                model=model,
-                fallback_model=fallback,
-                temperature=0.5,
-            )
-            options_decision = parse_options_decision(decision_raw)
-            logger.info(
-                "options_decision_complete",
-                open_new=len(options_decision.open_new),
-                closes=len(options_decision.close_positions),
-                rolls=len(options_decision.roll_positions),
-                outlook=options_decision.portfolio_outlook,
-            )
+                options_decision = parse_options_decision({
+                    "actions": [{"type": a.type, "symbol": a.symbol,
+                                 "contracts": a.contracts, "reason": a.reason} for a in actions],
+                    "outlook": "NEUTRAL",
+                    "confidence": 0.7,
+                    "market_comment": f"Rules engine proposed {len(proposed)} CSPs, {len(actions)} approved",
+                })
+                analysis_raw = {"market_regime": "RULES_ENGINE"}
+
+                logger.info("options_rules_complete", proposed=len(proposed), approved=len(actions))
+
+            else:
+                # ── Legacy LLM path (2 calls) ──
+                logger.info("options_phase2_analysis", model=model)
+
+                pass1_messages = build_options_pass1_messages(
+                    portfolio=portfolio,
+                    market_data=market_data,
+                    technical_signals=tech_signals,
+                    news_text=news_text,
+                    strategy_config=acct,
+                    active_positions=all_positions,
+                    iv_data=iv_data,
+                    portfolio_greeks=portfolio_greeks,
+                )
+
+                analysis_raw = self.llm.chat_json(
+                    messages=pass1_messages, model=model,
+                    fallback_model=fallback, temperature=0.7,
+                )
+                logger.info(
+                    "options_analysis_complete",
+                    regime=analysis_raw.get("market_regime"),
+                    iv_regime=analysis_raw.get("iv_regime"),
+                )
+
+                logger.info("options_phase3_decisions", model=model)
+
+                pass2_messages = build_options_pass2_messages(
+                    analysis_json=analysis_raw,
+                    portfolio=portfolio,
+                    strategy_config=acct,
+                    risk_profile=risk_profile,
+                    active_positions=all_positions,
+                    portfolio_greeks=portfolio_greeks,
+                    decision_history=history_text,
+                    market_data=market_data,
+                )
+
+                decision_raw = self.llm.chat_json(
+                    messages=pass2_messages, model=model,
+                    fallback_model=fallback, temperature=0.5,
+                )
+                options_decision = parse_options_decision(decision_raw)
+                logger.info(
+                    "options_decision_complete",
+                    open_new=len(options_decision.open_new),
+                    closes=len(options_decision.close_positions),
+                    outlook=options_decision.portfolio_outlook,
+                )
 
             # ===== PHASE 4: RISK VALIDATION =====
             logger.info("options_phase4_risk", account=account_name)
