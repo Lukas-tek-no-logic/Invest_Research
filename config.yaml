@@ -26,6 +26,7 @@ accounts:
     fallback_model: "Nemotron"
     broker_cost_model: "ibkr"
     cron: "0 20 * * 6"   # Sunday 20:00
+    decision_mode: "rules"
     strategy: "core_satellite"
     strategy_description: "Core-Satellite: 60% ETF core + 30% stock satellites + 10% cash reserve"
     prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha."
@@ -51,6 +52,7 @@ accounts:
     fallback_model: "Nemotron"
     broker_cost_model: "ibkr"
     cron: "20 20 1 * *"  # 1st of month 20:20 (staggered +20min vs Weekly)
+    decision_mode: "rules"
     strategy: "value_investing"
     strategy_description: "Value Investing: 40% ETF + 50% undervalued stocks + 10% cash reserve"
     prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding."
@@ -75,6 +77,7 @@ accounts:
     fallback_model: "Miro_Thinker"
     broker_cost_model: "ibkr"
     cron: "0 18 * * 0-4"  # Mon-Fri 18:00
+    decision_mode: "rules"
     strategy: "momentum"
     strategy_description: "Momentum/Swing: 20% ETF + 70% high-momentum stocks + 10% cash reserve"
     prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength."
@@ -84,9 +87,15 @@ accounts:
       max_position_pct: 25
       min_cash_pct: 10
       max_trades_per_cycle: 3
-      stop_loss_pct: -8
-      min_holding_days: 1
+      stop_loss_pct: -12           # was -8, less whipsaw
+      min_holding_days: 3          # was 1, prevent daily churn
       max_sector_exposure_pct: 50
+    rules_params:
+      use_fixed_watchlist: true    # NO dynamic screener symbols
+      rebalance_interval_days: 7   # weekly, not daily
+      min_momentum_score: 45
+      sell_score_threshold: 30
+      max_positions: 3
     watchlist:
       - SPY
       - QQQ
@@ -129,6 +138,7 @@ accounts:
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
     cron: "20 20 * * 6"  # Sunday 20:20 (staggered +20min vs Qwen)
+    decision_mode: "rules"
     strategy: "core_satellite"
     strategy_description: "Core-Satellite: 60% ETF core + 30% stock satellites + 10% cash reserve"
     prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha."
@@ -154,6 +164,7 @@ accounts:
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
     cron: "40 20 1 * *"  # 1st of month 20:40 (staggered +20min vs Qwen)
+    decision_mode: "rules"
     strategy: "value_investing"
     strategy_description: "Value Investing: 40% ETF + 50% undervalued stocks + 10% cash reserve"
     prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding."
@@ -178,6 +189,7 @@ accounts:
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
     cron: "20 18 * * 0-4"  # Mon-Fri 18:20 (staggered +20min vs Qwen)
+    decision_mode: "rules"
     strategy: "momentum"
     strategy_description: "Momentum/Swing: 20% ETF + 70% high-momentum stocks + 10% cash reserve"
     prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength."
@@ -187,9 +199,15 @@ accounts:
       max_position_pct: 25
       min_cash_pct: 10
       max_trades_per_cycle: 3
-      stop_loss_pct: -8
-      min_holding_days: 1
+      stop_loss_pct: -12           # was -8
+      min_holding_days: 3          # was 1
       max_sector_exposure_pct: 50
+    rules_params:
+      use_fixed_watchlist: true
+      rebalance_interval_days: 7
+      min_momentum_score: 45
+      sell_score_threshold: 30
+      max_positions: 3
     watchlist:
       - SPY
       - QQQ
