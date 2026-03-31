@@ -20,7 +20,7 @@ from apscheduler.triggers.cron import CronTrigger
 from .account_manager import AccountManager
 from .research_agent import ResearchAgent
 from .audit_logger import AuditLogger
-from .decision_parser import parse_analysis, parse_decision
+from .decision_parser import DecisionResult, parse_analysis, parse_decision
 from .ghostfolio_client import GhostfolioClient
 from .llm_client import LLMClient
 from .market_data import MarketDataProvider
