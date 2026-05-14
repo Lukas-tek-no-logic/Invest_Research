@@ -152,7 +152,9 @@ class Orchestrator:
                 if self._is_spreads_account(acct):
                     executor = SpreadsExecutor(
                         ghostfolio=self.ghostfolio,
+                        market_data=self.market_data,
                         tracker=tracker,
+                        account_id=account_id,
                         risk_profile=risk_profile,
                         dry_run=self.dry_run,
                         account_key=key,
@@ -160,7 +162,9 @@ class Orchestrator:
                 else:
                     executor = OptionsExecutor(
                         ghostfolio=self.ghostfolio,
+                        market_data=self.market_data,
                         tracker=tracker,
+                        account_id=account_id,
                         risk_profile=risk_profile,
                         dry_run=self.dry_run,
                         account_key=key,
@@ -741,6 +745,15 @@ class Orchestrator:
         error_msg = None
         bull_raw = {}
         bear_raw = {}
+        pass1_messages: list = []
+        pass2_messages: list = []
+        analysis_raw: dict = {}
+        decision_raw: dict = {}
+        executed_trades: list = []
+        portfolio_before: dict = {}
+        portfolio_after: dict = {}
+        risk_result = RiskManagerResult()
+        fees_paid = 0.0
 
         try:
             # ===== PHASE 1: GATHER CONTEXT =====

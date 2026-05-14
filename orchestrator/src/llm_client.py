@@ -94,7 +94,9 @@ class LLMClient:
         Tries primary model first; if JSON parsing fails and fallback_model
         is set, retries with the fallback.
         """
-        for current_model in [model, fallback_model] if fallback_model else [model]:
+        models_to_try = [model, fallback_model] if fallback_model else [model]
+        last_error: Exception | None = None
+        for current_model in models_to_try:
             try:
                 raw = self.chat(
                     messages=messages,
@@ -104,14 +106,22 @@ class LLMClient:
                 )
                 return self._extract_json(raw)
             except (json.JSONDecodeError, ValueError) as e:
+                last_error = e
                 logger.warning(
                     "llm_json_parse_failed",
                     model=current_model,
                     error=str(e),
                 )
-                if current_model == (fallback_model or model):
-                    raise
-        raise ValueError("Failed to get valid JSON from LLM")
+            except RuntimeError as e:
+                last_error = e
+                logger.warning(
+                    "llm_chat_unavailable",
+                    model=current_model,
+                    error=str(e),
+                )
+        raise RuntimeError(
+            f"LLM chat_json failed on all models ({', '.join(models_to_try)}): {last_error}"
+        )
 
     @staticmethod
     def _extract_json(text: str) -> dict:

@@ -9,6 +9,7 @@ All data comes from yfinance (free, no API key required).
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 
@@ -17,13 +18,30 @@ import yfinance as yf
 
 logger = structlog.get_logger()
 
+# yfinance logs Yahoo's 404 quoteSummary responses at ERROR level for every ETF
+# (SPY/QQQ/TQQQ/SOXL/XLE/...) — they have no fundamentals by design. We skip
+# .info for known ETFs below, but also raise the floor on the yfinance logger so
+# unexpected 404s from other tickers don't spam the cycle log either.
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
 _CACHE_TTL = 4 * 3600  # 4 hours — fundamentals change slowly
 _cache: dict[str, tuple[float, "FundamentalSnapshot"]] = {}  # symbol → (ts, data)
 
-# ETF symbols that don't have EPS / analyst data — skip deep fetch
-_ETF_PREFIXES = ("SPY", "QQQ", "VTI", "VOO", "IWM", "GLD", "TLT", "VXX",
-                 "TQQQ", "SOXL", "SOXS", "UVXY", "SCHD", "VYM", "XLE",
-                 "XLK", "XLF", "XLV", "XLY", "XLI", "XLB", "XLP", "XLU")
+# Known ETF symbols — no EPS / analyst data, so skip the yfinance .info call
+# entirely (Yahoo returns 404 for fundamentals on these by design).
+_ETF_SYMBOLS = frozenset((
+    "SPY", "QQQ", "VTI", "VOO", "IWM", "GLD", "TLT", "VXX",
+    "TQQQ", "SOXL", "SOXS", "UVXY", "SCHD", "VYM", "XLE",
+    "XLK", "XLF", "XLV", "XLY", "XLI", "XLB", "XLP", "XLU",
+    "XLC", "XLRE", "DIA", "EFA", "EEM", "AGG", "BND", "HYG",
+    "LQD", "SLV", "USO", "XBI", "ARKK", "ARKG", "SQQQ", "SPXL",
+    "SPXS", "TLT", "IEF", "SHY",
+))
+
+
+def _is_etf_symbol(symbol: str) -> bool:
+    """Detect ETF symbols by membership in known list or common suffix."""
+    return symbol in _ETF_SYMBOLS or symbol.endswith(("ETF", "ETF-USD"))
 
 
 @dataclass
@@ -205,8 +223,15 @@ def format_fundamentals_for_prompt(
 
 def _fetch(symbol: str) -> FundamentalSnapshot:
     """Fetch data from yfinance and build FundamentalSnapshot."""
-    is_etf = symbol in _ETF_PREFIXES or symbol.endswith(("ETF", "ETF-USD"))
+    is_etf = _is_etf_symbol(symbol)
     snap = FundamentalSnapshot(symbol=symbol, is_etf=is_etf)
+
+    # ETFs have no EPS / analyst / earnings data — Yahoo returns 404 on
+    # quoteSummary fundamentals for every one of them. The downstream prompt
+    # builder filters ETFs out (see format_fundamentals_for_prompt), so a bare
+    # snapshot with is_etf=True is all we need.
+    if is_etf:
+        return snap
 
     try:
         ticker = yf.Ticker(symbol)
@@ -218,23 +243,22 @@ def _fetch(symbol: str) -> FundamentalSnapshot:
             or info.get("previousClose")
         )
 
-        if not is_etf:
-            # Analyst consensus
-            rec_mean = info.get("recommendationMean")
-            snap.rec_label = _rec_mean_to_label(rec_mean)
-            snap.analyst_count = info.get("numberOfAnalystOpinions") or 0
-            snap.target_price = info.get("targetMeanPrice")
+        # Analyst consensus
+        rec_mean = info.get("recommendationMean")
+        snap.rec_label = _rec_mean_to_label(rec_mean)
+        snap.analyst_count = info.get("numberOfAnalystOpinions") or 0
+        snap.target_price = info.get("targetMeanPrice")
 
-            # Growth metrics
-            snap.eps_growth_yoy = info.get("earningsGrowth")
-            snap.revenue_growth_yoy = info.get("revenueGrowth")
+        # Growth metrics
+        snap.eps_growth_yoy = info.get("earningsGrowth")
+        snap.revenue_growth_yoy = info.get("revenueGrowth")
 
-            # EPS
-            snap.trailing_eps = info.get("trailingEps")
-            snap.forward_eps = info.get("forwardEps")
+        # EPS
+        snap.trailing_eps = info.get("trailingEps")
+        snap.forward_eps = info.get("forwardEps")
 
-            # Quarterly earnings beat/miss
-            snap.earnings_history = _fetch_earnings_history(ticker)
+        # Quarterly earnings beat/miss
+        snap.earnings_history = _fetch_earnings_history(ticker)
 
     except Exception as e:
         snap.fetch_error = str(e)
