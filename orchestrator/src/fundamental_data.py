@@ -18,30 +18,45 @@ import yfinance as yf
 
 logger = structlog.get_logger()
 
-# yfinance logs Yahoo's 404 quoteSummary responses at ERROR level for every ETF
-# (SPY/QQQ/TQQQ/SOXL/XLE/...) — they have no fundamentals by design. We skip
-# .info for known ETFs below, but also raise the floor on the yfinance logger so
-# unexpected 404s from other tickers don't spam the cycle log either.
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
 _CACHE_TTL = 4 * 3600  # 4 hours — fundamentals change slowly
 _cache: dict[str, tuple[float, "FundamentalSnapshot"]] = {}  # symbol → (ts, data)
 
 # Known ETF symbols — no EPS / analyst data, so skip the yfinance .info call
 # entirely (Yahoo returns 404 for fundamentals on these by design).
 _ETF_SYMBOLS = frozenset((
-    "SPY", "QQQ", "VTI", "VOO", "IWM", "GLD", "TLT", "VXX",
-    "TQQQ", "SOXL", "SOXS", "UVXY", "SCHD", "VYM", "XLE",
-    "XLK", "XLF", "XLV", "XLY", "XLI", "XLB", "XLP", "XLU",
+    "SPY", "QQQ", "VTI", "VOO", "IVV", "IWM", "GLD", "TLT", "VXX",
+    "TQQQ", "SOXL", "SOXS", "UVXY", "SCHD", "VYM", "VEA", "VOOG",
+    "XLE", "XLK", "XLF", "XLV", "XLY", "XLI", "XLB", "XLP", "XLU",
     "XLC", "XLRE", "DIA", "EFA", "EEM", "AGG", "BND", "HYG",
     "LQD", "SLV", "USO", "XBI", "ARKK", "ARKG", "SQQQ", "SPXL",
-    "SPXS", "TLT", "IEF", "SHY",
+    "SPXS", "IEF", "SHY",
 ))
 
 
 def _is_etf_symbol(symbol: str) -> bool:
     """Detect ETF symbols by membership in known list or common suffix."""
     return symbol in _ETF_SYMBOLS or symbol.endswith(("ETF", "ETF-USD"))
+
+
+class _YfFundamentals404Filter(logging.Filter):
+    """Drop yfinance ERROR records for Yahoo's "No fundamentals data found" 404s.
+
+    Many symbols (ETFs, indices, some recently-listed tickers) return 404 on
+    Yahoo's quoteSummary endpoint by design — yfinance logs these at ERROR
+    level, which floods scheduler logs every cycle. This filter drops only
+    those specific records and leaves everything else (real delisting
+    warnings like "CTRA possibly delisted", auth failures, rate limits, etc.)
+    intact.
+    """
+
+    _NEEDLES = ("No fundamentals data found", "fundamentals data found for symbol")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not any(n in msg for n in self._NEEDLES)
+
+
+logging.getLogger("yfinance").addFilter(_YfFundamentals404Filter())
 
 
 @dataclass

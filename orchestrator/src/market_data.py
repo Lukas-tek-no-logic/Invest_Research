@@ -9,6 +9,8 @@ import structlog
 import yfinance as yf
 import pandas as pd
 
+from .fundamental_data import _is_etf_symbol
+
 logger = structlog.get_logger()
 
 QUOTE_CACHE_TTL = 60  # seconds
@@ -57,33 +59,59 @@ class MarketDataProvider:
         return None
 
     def get_quote(self, symbol: str) -> StockQuote:
-        """Get current quote with fundamentals for a symbol."""
+        """Get current quote with fundamentals for a symbol.
+
+        For known ETFs we skip `ticker.info` (Yahoo's quoteSummary endpoint
+        returns 404 for every ETF — wasted round-trip and stack noise) and
+        build a minimal StockQuote from `fast_info` plus a brief history
+        fallback for change% / 52w range.
+        """
         cached = self._get_cached(self._quote_cache, symbol, self._quote_ttl)
         if cached:
             return cached
 
         ticker = yf.Ticker(symbol)
-        info = ticker.info
         fast = ticker.fast_info
 
-        quote = StockQuote(
-            symbol=symbol,
-            price=fast.get("lastPrice", 0) or info.get("currentPrice", 0) or info.get("regularMarketPrice", 0),
-            change_pct=info.get("regularMarketChangePercent", 0) or 0,
-            volume=info.get("regularMarketVolume", 0) or 0,
-            avg_volume_10d=info.get("averageDailyVolume10Day", 0) or 0,
-            market_cap=info.get("marketCap", 0) or 0,
-            pe_ratio=info.get("trailingPE"),
-            forward_pe=info.get("forwardPE"),
-            pb_ratio=info.get("priceToBook"),
-            dividend_yield=info.get("dividendYield"),
-            week52_high=info.get("fiftyTwoWeekHigh", 0) or 0,
-            week52_low=info.get("fiftyTwoWeekLow", 0) or 0,
-            sector=info.get("sector", "Unknown"),
-            industry=info.get("industry", "Unknown"),
-            name=info.get("shortName", symbol),
-            short_pct_float=info.get("shortPercentOfFloat"),
-        )
+        if _is_etf_symbol(symbol):
+            quote = StockQuote(
+                symbol=symbol,
+                price=fast.get("lastPrice", 0) or 0,
+                change_pct=0,  # not exposed via fast_info reliably
+                volume=fast.get("lastVolume", 0) or 0,
+                avg_volume_10d=fast.get("tenDayAverageVolume", 0) or 0,
+                market_cap=fast.get("marketCap", 0) or 0,
+                pe_ratio=None,
+                forward_pe=None,
+                pb_ratio=None,
+                dividend_yield=None,
+                week52_high=fast.get("yearHigh", 0) or 0,
+                week52_low=fast.get("yearLow", 0) or 0,
+                sector="ETF",
+                industry="ETF",
+                name=symbol,
+                short_pct_float=None,
+            )
+        else:
+            info = ticker.info
+            quote = StockQuote(
+                symbol=symbol,
+                price=fast.get("lastPrice", 0) or info.get("currentPrice", 0) or info.get("regularMarketPrice", 0),
+                change_pct=info.get("regularMarketChangePercent", 0) or 0,
+                volume=info.get("regularMarketVolume", 0) or 0,
+                avg_volume_10d=info.get("averageDailyVolume10Day", 0) or 0,
+                market_cap=info.get("marketCap", 0) or 0,
+                pe_ratio=info.get("trailingPE"),
+                forward_pe=info.get("forwardPE"),
+                pb_ratio=info.get("priceToBook"),
+                dividend_yield=info.get("dividendYield"),
+                week52_high=info.get("fiftyTwoWeekHigh", 0) or 0,
+                week52_low=info.get("fiftyTwoWeekLow", 0) or 0,
+                sector=info.get("sector", "Unknown"),
+                industry=info.get("industry", "Unknown"),
+                name=info.get("shortName", symbol),
+                short_pct_float=info.get("shortPercentOfFloat"),
+            )
 
         self._quote_cache[symbol] = _CacheEntry(data=quote, timestamp=time.time())
         logger.debug("market_data_quote_fetched", symbol=symbol, price=quote.price)
@@ -118,7 +146,12 @@ class MarketDataProvider:
         return df
 
     def get_current_price(self, symbol: str) -> float:
-        """Get just the current price (lightweight)."""
+        """Get just the current price (lightweight).
+
+        For ETFs we never fall back to `ticker.info` — that endpoint returns
+        404 for every ETF on Yahoo and only wastes a round-trip. If fast_info
+        fails for an ETF the caller will get 0 and can handle it.
+        """
         ticker = yf.Ticker(symbol)
         try:
             fast = ticker.fast_info
@@ -127,6 +160,8 @@ class MarketDataProvider:
                 return price
         except Exception:
             pass
+        if _is_etf_symbol(symbol):
+            return 0
         info = ticker.info
         return info.get("currentPrice", 0) or info.get("regularMarketPrice", 0) or 0
 
@@ -136,6 +171,8 @@ class MarketDataProvider:
         cutoff = date.today() + timedelta(days=days)
         result = {}
         for symbol in symbols:
+            if _is_etf_symbol(symbol):
+                continue  # ETFs don't have earnings
             try:
                 ticker = yf.Ticker(symbol)
                 cal = ticker.calendar
@@ -171,6 +208,9 @@ class MarketDataProvider:
         """Check if a symbol is valid and tradeable."""
         try:
             ticker = yf.Ticker(symbol)
+            if _is_etf_symbol(symbol):
+                fast = ticker.fast_info
+                return bool(fast.get("lastPrice", 0))
             info = ticker.info
             return bool(info.get("regularMarketPrice") or info.get("currentPrice"))
         except Exception:
