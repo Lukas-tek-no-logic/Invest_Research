@@ -277,6 +277,10 @@ class SpreadsExecutor:
                 )
             if close_value is None:
                 close_value = pos.current_value or abs(pos.entry_debit or 0)
+            else:
+                strikes = ([l.strike for l in all_legs] if all_legs
+                           else [pos.buy_strike, pos.sell_strike])
+                close_value = self._clamp_value(close_value, strikes, pos.id, "close")
 
             ghostfolio_order_id = None
             if not self.dry_run:
@@ -389,6 +393,10 @@ class SpreadsExecutor:
                         error="Could not fetch current option price",
                     )
 
+            strikes = ([l.strike for l in all_legs] if all_legs
+                       else [pos.buy_strike, pos.sell_strike])
+            current_value = self._clamp_value(current_value, strikes, pos.id, "update")
+
             # P&L depends on whether it's a debit or credit spread
             if entry_debit > 0:
                 # Debit spread: P&L = (current_value - entry_debit) * contracts * 100
@@ -419,6 +427,32 @@ class SpreadsExecutor:
                 spread_type=pos.spread_type,
                 position_id=pos.id, success=False, error=str(e),
             )
+
+    # -- Value sanity guard --
+
+    @staticmethod
+    def _clamp_value(value: float, strikes: list, pos_id, label: str) -> float:
+        """Clamp a per-share spread/option value to its structural maximum.
+
+        A defined-risk spread's net per-share value cannot exceed the span
+        between its strikes; a single option cannot exceed its strike. Larger
+        magnitudes only come from bad leg pricing (e.g. a stale lastPrice on an
+        illiquid leg when bid/ask are both 0) and, once multiplied by 100 and
+        written to Ghostfolio, corrupt the account cash balance. So we cap the
+        value at its structural bound and log it for investigation.
+        """
+        valid = [float(s) for s in strikes if s and float(s) > 0]
+        if not valid:
+            return value
+        bound = valid[0] if len(valid) == 1 else max(valid) - min(valid)
+        if bound > 0 and abs(value) > bound:
+            clamped = round(bound if value >= 0 else -bound, 2)
+            logger.warning(
+                "spread_value_clamped", pos_id=pos_id, label=label,
+                raw=round(value, 2), bound=round(bound, 2),
+            )
+            return clamped
+        return value
 
     # -- Ghostfolio helpers --
 
