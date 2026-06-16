@@ -19,6 +19,8 @@ from pathlib import Path
 import structlog
 import yfinance as yf
 
+from .yf_throttle import paced_call
+
 logger = structlog.get_logger()
 
 # Screener sources to query (tried in order, failures silently skipped)
@@ -121,7 +123,7 @@ class WatchlistManager:
 
         for screen in _SCREENER_SOURCES:
             try:
-                data = yf.screen(screen, count=max_per_source * 2)
+                data = paced_call(lambda: yf.screen(screen, count=max_per_source * 2), label=f"screen:{screen}")
                 quotes = data.get("quotes", []) if isinstance(data, dict) else []
                 added = 0
                 for q in quotes:

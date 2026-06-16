@@ -10,6 +10,7 @@ import yfinance as yf
 import pandas as pd
 
 from .fundamental_data import _is_etf_symbol
+from .yf_throttle import paced_call
 
 logger = structlog.get_logger()
 
@@ -70,8 +71,7 @@ class MarketDataProvider:
         if cached:
             return cached
 
-        ticker = yf.Ticker(symbol)
-        fast = ticker.fast_info
+        fast = paced_call(lambda: dict(yf.Ticker(symbol).fast_info), label=f"fast:{symbol}")
 
         if _is_etf_symbol(symbol):
             quote = StockQuote(
@@ -93,7 +93,7 @@ class MarketDataProvider:
                 short_pct_float=None,
             )
         else:
-            info = ticker.info
+            info = paced_call(lambda: yf.Ticker(symbol).info, label=f"info:{symbol}")
             quote = StockQuote(
                 symbol=symbol,
                 price=fast.get("lastPrice", 0) or info.get("currentPrice", 0) or info.get("regularMarketPrice", 0),
@@ -136,11 +136,16 @@ class MarketDataProvider:
         end: str | None = None,
     ) -> pd.DataFrame:
         """Get historical OHLCV data."""
-        ticker = yf.Ticker(symbol)
         if start and end:
-            df = ticker.history(start=start, end=end, interval=interval)
+            df = paced_call(
+                lambda: yf.Ticker(symbol).history(start=start, end=end, interval=interval),
+                label=f"hist:{symbol}",
+            )
         else:
-            df = ticker.history(period=period, interval=interval)
+            df = paced_call(
+                lambda: yf.Ticker(symbol).history(period=period, interval=interval),
+                label=f"hist:{symbol}",
+            )
         if df.empty:
             logger.warning("market_data_empty_history", symbol=symbol, period=period)
         return df
@@ -152,9 +157,8 @@ class MarketDataProvider:
         404 for every ETF on Yahoo and only wastes a round-trip. If fast_info
         fails for an ETF the caller will get 0 and can handle it.
         """
-        ticker = yf.Ticker(symbol)
         try:
-            fast = ticker.fast_info
+            fast = paced_call(lambda: dict(yf.Ticker(symbol).fast_info), label=f"fast:{symbol}")
             price = fast.get("lastPrice", 0) or 0
             if price:
                 return price
@@ -162,7 +166,7 @@ class MarketDataProvider:
             pass
         if _is_etf_symbol(symbol):
             return 0
-        info = ticker.info
+        info = paced_call(lambda: yf.Ticker(symbol).info, label=f"info:{symbol}")
         return info.get("currentPrice", 0) or info.get("regularMarketPrice", 0) or 0
 
     def get_upcoming_earnings(self, symbols: list[str], days: int = 14) -> dict[str, str]:
@@ -174,8 +178,7 @@ class MarketDataProvider:
             if _is_etf_symbol(symbol):
                 continue  # ETFs don't have earnings
             try:
-                ticker = yf.Ticker(symbol)
-                cal = ticker.calendar
+                cal = paced_call(lambda: yf.Ticker(symbol).calendar, label=f"cal:{symbol}")
                 if not isinstance(cal, dict):
                     continue
                 dates_raw = cal.get("Earnings Date", [])
@@ -207,11 +210,10 @@ class MarketDataProvider:
     def validate_symbol(self, symbol: str) -> bool:
         """Check if a symbol is valid and tradeable."""
         try:
-            ticker = yf.Ticker(symbol)
             if _is_etf_symbol(symbol):
-                fast = ticker.fast_info
+                fast = paced_call(lambda: dict(yf.Ticker(symbol).fast_info), label=f"fast:{symbol}")
                 return bool(fast.get("lastPrice", 0))
-            info = ticker.info
+            info = paced_call(lambda: yf.Ticker(symbol).info, label=f"info:{symbol}")
             return bool(info.get("regularMarketPrice") or info.get("currentPrice"))
         except Exception:
             return False
@@ -233,12 +235,11 @@ class MarketDataProvider:
         overview = {}
         for sym, label in benchmarks.items():
             try:
-                ticker = yf.Ticker(sym)
-                fast = ticker.fast_info
+                fast = paced_call(lambda: dict(yf.Ticker(sym).fast_info), label=f"fast:{sym}")
                 overview[sym] = {
                     "label": label,
                     "price": fast.get("lastPrice", 0),
-                    "change_pct": fast.get("regularMarketChangePercent", 0) if hasattr(fast, "regularMarketChangePercent") else 0,
+                    "change_pct": fast.get("regularMarketChangePercent", 0),
                 }
             except Exception as e:
                 logger.warning("market_overview_failed", symbol=sym, error=str(e))

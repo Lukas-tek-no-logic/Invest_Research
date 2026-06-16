@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 import structlog
 import yfinance as yf
 
+from .yf_throttle import paced_call
+
 logger = structlog.get_logger()
 
 _CACHE_TTL = 4 * 3600  # 4 hours — fundamentals change slowly
@@ -250,7 +252,7 @@ def _fetch(symbol: str) -> FundamentalSnapshot:
 
     try:
         ticker = yf.Ticker(symbol)
-        info = ticker.info
+        info = paced_call(lambda: ticker.info, label=f"info:{symbol}")
 
         snap.current_price = (
             info.get("currentPrice")
@@ -286,7 +288,7 @@ def _fetch_earnings_history(ticker: yf.Ticker) -> list[EarningsQuarter]:
     """Extract last 2-4 quarterly earnings beat/miss records."""
     quarters: list[EarningsQuarter] = []
     try:
-        qe = ticker.quarterly_earnings  # DataFrame: index=date, cols=[Actual, Estimate]
+        qe = paced_call(lambda: ticker.quarterly_earnings, label="qe")  # DataFrame: index=date, cols=[Actual, Estimate]
         if qe is None or qe.empty:
             return quarters
         # Newest first

@@ -9,6 +9,8 @@ import pandas as pd
 import structlog
 import yfinance as yf
 
+from ..yf_throttle import paced_call
+
 logger = structlog.get_logger()
 
 # Liquidity minimums
@@ -41,14 +43,15 @@ def get_option_chain(
         ticker = yf.Ticker(symbol)
 
         # Current underlying price
-        fast = ticker.fast_info
-        underlying_price = float(getattr(fast, "last_price", 0) or 0)
+        underlying_price = float(
+            paced_call(lambda: getattr(ticker.fast_info, "last_price", 0), label=f"opt-fast:{symbol}") or 0
+        )
         if underlying_price <= 0:
             logger.warning("options_no_price", symbol=symbol)
             return None
 
         # Available expirations
-        expirations = ticker.options
+        expirations = paced_call(lambda: ticker.options, label=f"opt-exp:{symbol}")
         if not expirations:
             logger.warning("options_no_expirations", symbol=symbol)
             return None
@@ -72,7 +75,7 @@ def get_option_chain(
         _, dte, expiration = candidates[0]
 
         # Fetch chain
-        chain = ticker.option_chain(expiration)
+        chain = paced_call(lambda: ticker.option_chain(expiration), label=f"opt-chain:{symbol}")
 
         calls = _filter_chain(chain.calls, underlying_price)
         puts = _filter_chain(chain.puts, underlying_price)
@@ -151,7 +154,7 @@ def get_iv_percentile(symbol: str, lookback_days: int = 252) -> dict | None:
     try:
         import numpy as np
         ticker = yf.Ticker(symbol)
-        hist = ticker.history(period="2y", interval="1d")
+        hist = paced_call(lambda: ticker.history(period="2y", interval="1d"), label=f"opt-hist:{symbol}")
         if hist.empty or len(hist) < 30:
             return None
 
@@ -194,7 +197,7 @@ def get_current_option_price(
     """Fetch mid-price (bid+ask)/2 for a specific option contract."""
     try:
         ticker = yf.Ticker(symbol)
-        chain = ticker.option_chain(expiration)
+        chain = paced_call(lambda: ticker.option_chain(expiration), label=f"opt-chain:{symbol}")
         df = chain.calls if option_type == "call" else chain.puts
         row = df[df["strike"] == strike]
         if row.empty:

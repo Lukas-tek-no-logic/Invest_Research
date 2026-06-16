@@ -167,11 +167,12 @@ class ResearchAgent:
     def _gather_screeners(self, max_per_source: int) -> str:
         """Run multiple yfinance screeners and return formatted results."""
         import yfinance as yf
+        from .yf_throttle import paced_call
         lines = ["== MARKET SCREENERS =="]
 
         for screener_name in RESEARCH_SCREENERS:
             try:
-                result = yf.screen(screener_name)
+                result = paced_call(lambda: yf.screen(screener_name), label=f"screen:{screener_name}")
                 quotes = result.get("quotes", [])[:max_per_source]
                 symbols = [q.get("symbol", "") for q in quotes if q.get("symbol")]
                 lines.append(f"\n{screener_name.upper()} ({len(symbols)} symbols):")
