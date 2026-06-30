@@ -213,6 +213,7 @@ _options_pl_cache: dict[str, float] = {
 # have mismatched BUY/SELL symbols and create phantom holdings — exclude securities).
 # Fallback for options: initial_budget + realized_pl if Ghostfolio data unavailable.
 initial_budget = config.get("defaults", {}).get("initial_budget", 10000)
+audit = AuditLogger()
 _total_value = 0.0
 _total_accounts = 0
 for _key, _acct in trading_accounts.items():
@@ -229,6 +230,14 @@ for _key, _acct in trading_accounts.items():
     elif _live.get("total"):
         _total_value += _live["total"]
         _total_accounts += 1
+    else:
+        # Ghostfolio valuation unavailable → use last known good audit value so the
+        # total stays consistent with the per-account cards (otherwise stock accounts
+        # silently drop out and the total % is computed over too few accounts).
+        _last_good = audit._last_known_valuation(_key)
+        if _last_good is not None:
+            _total_value += _last_good[0]
+            _total_accounts += 1
 
 # Title row with total balance
 _title_col, _metric_col = st.columns([3, 1])
@@ -248,8 +257,6 @@ with _metric_col:
 
 if not _ghostfolio_ok:
     st.error("Ghostfolio niedostępny — wartości kont mogą być nieaktualne (dane z ostatniego cyklu)")
-
-audit = AuditLogger()
 
 # Group accounts by strategy
 _STRATEGY_LABELS = {
@@ -317,8 +324,16 @@ for strategy_key in _GROUP_ORDER:
                 value = live["total"]
                 pl_pct = (value - acct_budget) / acct_budget * 100 if acct_budget else None
             else:
+                # Ghostfolio valuation unavailable → fall back to the audit log.
+                # The latest row may carry a 0 from a cycle that ran while Ghostfolio
+                # was down, so prefer the last cycle with a positive valuation instead
+                # of showing a misleading $0.00 card.
                 value = latest.get("portfolio_value")
                 pl_pct = latest.get("portfolio_pl_pct")
+                if not value:
+                    last_good = audit._last_known_valuation(key)
+                    if last_good is not None:
+                        value, pl_pct, _ = last_good
 
             st.markdown(f"**{name}**")
             if value is not None:

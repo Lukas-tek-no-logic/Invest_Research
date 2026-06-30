@@ -150,6 +150,24 @@ class AuditLogger:
         # (cash updated; total_value still approximate until next Ghostfolio sync)
         p_after = portfolio_after if isinstance(portfolio_after, dict) else p_before
 
+        # Portfolio valuation can fail (e.g. Ghostfolio valuation endpoints 500 due to a
+        # stalled snapshot job). When that happens get_portfolio_state() returns an empty
+        # state with total_value=0, which must NOT be persisted — a real account always has
+        # positive cash, so a 0/None here means "unknown", not "wiped out". Carry forward
+        # the last known good values so the dashboard keeps showing the last valid snapshot
+        # instead of $0.00 cards.
+        pv = p_after.get("total_value", p_before.get("total_value"))
+        pl_pct = p_after.get("total_pl_pct", p_before.get("total_pl_pct"))
+        cash_val = p_after.get("cash", p_before.get("cash"))
+        if pv is None or pv <= 0:
+            last_good = self._last_known_valuation(account_key)
+            if last_good is not None:
+                pv, pl_pct, cash_val = last_good
+                logger.warning(
+                    "audit_valuation_unavailable_carried_forward",
+                    account=account_key, carried_value=pv,
+                )
+
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
@@ -170,9 +188,9 @@ class AuditLogger:
                         len(decision.get("actions", [])),
                         len(forced_actions or []),
                         len(rejected_actions or []),
-                        p_after.get("total_value", p_before.get("total_value")),
-                        p_after.get("total_pl_pct", p_before.get("total_pl_pct")),
-                        p_after.get("cash", p_before.get("cash")),
+                        pv,
+                        pl_pct,
+                        cash_val,
                         str(log_file),
                         0 if error else 1,
                         error,
@@ -183,6 +201,30 @@ class AuditLogger:
 
         logger.info("audit_log_written", file=str(log_file), account=account_key)
         return str(log_file)
+
+    def _last_known_valuation(
+        self, account_key: str
+    ) -> tuple[float, float | None, float | None] | None:
+        """Return (portfolio_value, portfolio_pl_pct, cash) from the most recent cycle
+        that had a positive portfolio_value, or None if there is no such row.
+
+        Used to carry forward the last valid snapshot when the current cycle could not
+        value the portfolio (e.g. Ghostfolio valuation endpoints down)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                row = conn.execute(
+                    """SELECT portfolio_value, portfolio_pl_pct, cash FROM decision_log
+                    WHERE account_key = ? AND portfolio_value IS NOT NULL
+                      AND portfolio_value > 0
+                    ORDER BY timestamp DESC LIMIT 1""",
+                    (account_key,),
+                ).fetchone()
+            if row is None:
+                return None
+            return float(row[0]), row[1], row[2]
+        except Exception as e:
+            logger.error("audit_last_valuation_lookup_failed", error=str(e))
+            return None
 
     def get_decision_history(
         self,
