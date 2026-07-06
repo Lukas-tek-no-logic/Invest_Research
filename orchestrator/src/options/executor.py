@@ -10,9 +10,15 @@ Handles:
   update_active_positions() — refresh DTE / P&L for held positions
 
 Ghostfolio integration:
-  CSP open  → BUY  "WHEEL-{SYM}-CSP-{YYYYMMDD}-{strike}P"  unit_price=premium
-  CC  open  → BUY  "WHEEL-{SYM}-CC-{YYYYMMDD}-{strike}C"   unit_price=premium
-  Close     → SELL same symbol, unit_price=close_value
+  CSP open  → SELL "GF_WHEEL-{SYM}-CSP-{YYYYMMDD}-{strike}P"  unit_price=premium
+  CC  open  → SELL "GF_WHEEL-{SYM}-CC-{YYYYMMDD}-{strike}C"   unit_price=premium
+  Close     → BUY same symbol, unit_price=close_value
+
+The "GF_" prefix is load-bearing: Ghostfolio rewrites the symbol of every
+MANUAL BUY to a random UUID unless it starts with "GF_" (order.service.ts),
+which would put the close buy-back on a different symbol profile than the
+open - the pair would never net to zero and closed positions would distort
+the account value forever.
 """
 
 from __future__ import annotations
@@ -554,7 +560,7 @@ class OptionsExecutor:
         """
         try:
             exp_compact = csp.expiration.replace("-", "")
-            symbol = f"WHEEL-{csp.symbol}-CSP-{exp_compact}-{int(csp.strike)}P"
+            symbol = f"GF_WHEEL-{csp.symbol}-CSP-{exp_compact}-{int(csp.strike)}P"
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
@@ -576,7 +582,7 @@ class OptionsExecutor:
         """
         try:
             exp_compact = cc.expiration.replace("-", "")
-            symbol = f"WHEEL-{cc.symbol}-CC-{exp_compact}-{int(cc.strike)}C"
+            symbol = f"GF_WHEEL-{cc.symbol}-CC-{exp_compact}-{int(cc.strike)}C"
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
@@ -656,11 +662,11 @@ class OptionsExecutor:
         try:
             exp_compact = pos.expiration_date.replace("-", "")
             if pos.spread_type == "CASH_SECURED_PUT":
-                symbol = f"WHEEL-{pos.symbol}-CSP-{exp_compact}-{int(pos.sell_strike)}P"
+                symbol = f"GF_WHEEL-{pos.symbol}-CSP-{exp_compact}-{int(pos.sell_strike)}P"
             elif pos.spread_type == "COVERED_CALL":
-                symbol = f"WHEEL-{pos.symbol}-CC-{exp_compact}-{int(pos.sell_strike)}C"
+                symbol = f"GF_WHEEL-{pos.symbol}-CC-{exp_compact}-{int(pos.sell_strike)}C"
             else:
-                symbol = f"OPT-{pos.symbol}-{pos.spread_type}-{exp_compact}"
+                symbol = f"GF_OPT-{pos.symbol}-{pos.spread_type}-{exp_compact}"
 
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,

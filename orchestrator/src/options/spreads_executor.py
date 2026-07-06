@@ -7,8 +7,13 @@ Handles:
   update_active_positions() - refresh DTE / P&L for held positions
 
 Ghostfolio integration:
-  Open  -> BUY  "SPREAD-{SYM}-{TYPE}-{YYYYMMDD}-{strikes}"  unit_price=net_debit
+  Open  -> BUY  "GF_SPREAD-{SYM}-{TYPE}-{YYYYMMDD}-{strikes}"  unit_price=net_debit
   Close -> SELL same symbol, unit_price=close_value
+
+The "GF_" prefix is load-bearing: Ghostfolio rewrites the symbol of every
+MANUAL BUY to a random UUID unless it starts with "GF_" (order.service.ts),
+which would put open and close on different symbol profiles - the pair would
+never net to zero and closed positions would distort the account value forever.
 """
 
 from __future__ import annotations
@@ -465,7 +470,7 @@ class SpreadsExecutor:
         try:
             exp_compact = spread.expiration.replace("-", "")
             strikes = "-".join(f"{int(l.strike)}" for l in spread.legs)
-            symbol = f"SPREAD-{spread.symbol}-{spread.spread_type.upper()}-{exp_compact}-{strikes}"
+            symbol = f"GF_SPREAD-{spread.symbol}-{spread.spread_type.upper()}-{exp_compact}-{strikes}"
             symbol = symbol[:50]
 
             raw_debit = abs(spread.net_debit) if spread.net_debit != 0 else 0.01
@@ -492,7 +497,7 @@ class SpreadsExecutor:
         try:
             exp_compact = pos.expiration_date.replace("-", "")
             symbol = (
-                f"SPREAD-{pos.symbol}-{pos.spread_type}-{exp_compact}-"
+                f"GF_SPREAD-{pos.symbol}-{pos.spread_type}-{exp_compact}-"
                 f"{int(pos.buy_strike)}-{int(pos.sell_strike)}"
             )
             symbol = symbol[:50]
