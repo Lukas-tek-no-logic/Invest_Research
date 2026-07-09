@@ -65,6 +65,14 @@ class OptionsRiskManager:
         self.earnings_blackout_days: int = risk_profile.get("earnings_blackout_days", 5)
         self.take_profit_pct: float = risk_profile.get("take_profit_pct", 50.0)
         self.auto_close_dte: int = risk_profile.get("auto_close_dte", 3)
+        # Vintage diversification: cap new CSPs opened in a single cycle so the
+        # whole account is never bet on one open date / IV level / spot price.
+        self.max_new_csps_per_cycle: int = risk_profile.get("max_new_csps_per_cycle", 2)
+        # Cap total reserved collateral so a broad gap-down with multiple
+        # simultaneous assignments cannot consume the whole account. 85% still
+        # admits one large sub-$80 CSP on a $10K account (by design) but blocks
+        # stacking two of them.
+        self.max_collateral_pct: float = risk_profile.get("max_collateral_pct", 85.0)
         # For legacy compatibility (greeks-based delta warnings)
         self.max_portfolio_delta_pct: float = risk_profile.get("max_portfolio_delta_pct", 15.0)
 
@@ -77,6 +85,7 @@ class OptionsRiskManager:
         portfolio: PortfolioState,
         portfolio_greeks=None,      # optional; only used for delta warning
         market_data: dict | None = None,   # symbol → {price, ...}
+        vix: float | None = None,   # deterministic VIX; low IV → open slower
     ) -> OptionsRiskResult:
         """Validate all wheel actions and auto-close rules.
 
@@ -165,6 +174,12 @@ class OptionsRiskManager:
         # Track symbols already approved this cycle to prevent LLM from opening same symbol twice
         approved_csp_symbols = {p.symbol for p in open_csps if p.id not in closing_ids}
 
+        # Per-cycle vintage limit: at low IV (VIX < 20) premium is thin — deploy
+        # even slower rather than racing collateral into a cheap-vol market.
+        per_cycle_limit = 1 if (vix is not None and vix < 20) else self.max_new_csps_per_cycle
+        new_csps_this_cycle = 0
+        max_collateral = account_value * self.max_collateral_pct / 100
+
         for action in decision.actions:
             if action.type != "SELL_CSP":
                 continue
@@ -172,7 +187,17 @@ class OptionsRiskManager:
             symbol = action.symbol
             contracts = max(1, action.contracts)
 
-            # 0. Duplicate check within this cycle
+            # 0a. Per-cycle limit (vintage diversification)
+            if new_csps_this_cycle >= per_cycle_limit:
+                reason = (
+                    f"Per-cycle CSP limit reached ({per_cycle_limit} this cycle"
+                    f"{', low-IV throttle: VIX ' + format(vix, '.1f') if vix is not None and vix < 20 else ''})"
+                )
+                result.rejected_opens.append({"instruction": action, "reason": reason})
+                result.modifications.append(f"[REJECTED CSP] {symbol}: {reason}")
+                continue
+
+            # 0b. Duplicate check within this cycle
             if symbol in approved_csp_symbols:
                 reason = f"CSP for {symbol} already open or approved this cycle — skipped"
                 result.rejected_opens.append({"instruction": action, "reason": reason})
@@ -231,6 +256,19 @@ class OptionsRiskManager:
                 result.modifications.append(f"[REJECTED CSP] {symbol}: {reason}")
                 continue
 
+            # Collateral concentration cap: total reserved ≤ max_collateral_pct
+            # (gap-down multi-assignment protection — checked after the cash fit
+            # so the more actionable "insufficient cash" reason wins when both apply)
+            if reserved_collateral + estimated_assignment > max_collateral:
+                reason = (
+                    f"Collateral cap: total reserved would exceed "
+                    f"{self.max_collateral_pct:.0f}% of account "
+                    f"(${reserved_collateral + estimated_assignment:,.0f} > ${max_collateral:,.0f})"
+                )
+                result.rejected_opens.append({"instruction": action, "reason": reason})
+                result.modifications.append(f"[REJECTED CSP] {symbol}: {reason}")
+                continue
+
             # 3. Earnings blackout — only block if earnings are described as IMMINENT
             if _earnings_flag_in_reason(action.reason):
                 reason = f"Action flagged as near-earnings: '{action.reason}'"
@@ -242,7 +280,9 @@ class OptionsRiskManager:
             result.approved_opens.append(action)
             approved_csp_symbols.add(symbol)
             current_csp_count += 1
+            new_csps_this_cycle += 1
             cash_available -= estimated_assignment
+            reserved_collateral += estimated_assignment
 
         # ── Step 4: Validate SELL_CC actions ─────────────────────────────────
         for action in decision.actions:

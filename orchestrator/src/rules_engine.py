@@ -170,7 +170,7 @@ class RulesEngine:
 
             # Score components
             pe_score = self._inverse_linear_score(pe, 10, 40, 25)
-            div_score = self._linear_score(div_y, 0, 0.03, 15)
+            div_score = self._linear_score(div_y, 0, 3.0, 15)  # div_yield is in percent
             momentum_score = 0.0
             if price and sma200 and sma200 > 0:
                 rel = (price - sma200) / sma200
@@ -269,7 +269,7 @@ class RulesEngine:
 
         pe_max = params.get("pe_max", 20)
         pb_max = params.get("pb_max", 3.0)
-        div_min = params.get("div_yield_min", 0.015)
+        div_min = params.get("div_yield_min", 1.5)  # percent (yfinance returns 2.54 = 2.54%)
         min_score = params.get("min_value_score", 50)
         max_positions = params.get("max_positions", 5)
         max_position_pct = risk_profile.get("max_position_pct", 15)
@@ -296,7 +296,7 @@ class RulesEngine:
             # Score
             pe_score = self._inverse_linear_score(pe, 10, 20, 30)
             pb_score = self._inverse_linear_score(pb, 1.0, 3.0, 15) if pb else 0
-            div_score = self._linear_score(div_y, 0, 0.04, 20)
+            div_score = self._linear_score(div_y, 0, 4.0, 20)  # div_yield is in percent
             eps_score = self._linear_score(eps_g, 0, 0.20, 20) if eps_g else 0
 
             upside_score = 0.0
@@ -326,10 +326,10 @@ class RulesEngine:
                     urgency="MEDIUM", thesis=f"Value thesis broken: P/E expanded to {pe:.1f}",
                     stop_loss_pct=stop_loss_pct,
                 ))
-            elif div_y is not None and div_y < 0.01:
+            elif div_y is not None and div_y < 1.0:  # percent
                 actions.append(TradeAction(
                     type="SELL", symbol=pos.symbol, amount_usd=pos.market_value,
-                    urgency="MEDIUM", thesis=f"Dividend cut below 1%: {div_y*100:.2f}%",
+                    urgency="MEDIUM", thesis=f"Dividend cut below 1%: {div_y:.2f}%",
                     stop_loss_pct=stop_loss_pct,
                 ))
 

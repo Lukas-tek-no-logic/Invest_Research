@@ -75,11 +75,12 @@ class NewsFetcher:
                 logger.warning("news_feed_failed", source=source_name, error=str(e))
 
         # Drop stale items — a months-old story presented as current misleads
-        # the model. Undated items are kept but ranked last (see sort key).
+        # the model. Undated items are dropped too: an unverifiable date is how
+        # a Jan-2025 "AI rout" story ended up justifying a bear call in Jul 2026.
         max_age_h = MAX_NEWS_AGE_DAYS * 24
         fresh_items = [
             it for it in all_items
-            if it.age_hours is None or it.age_hours <= max_age_h
+            if it.age_hours is not None and it.age_hours <= max_age_h
         ]
         if len(fresh_items) < len(all_items):
             logger.info(

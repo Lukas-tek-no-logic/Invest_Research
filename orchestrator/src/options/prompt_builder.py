@@ -355,6 +355,9 @@ def _format_market_with_iv(
 def _format_wheel_risk_rules(risk_profile: dict) -> str:
     return (
         f"Max open CSP positions: {risk_profile.get('max_open_csps', 3)}\n"
+        f"Max NEW CSPs per cycle: {risk_profile.get('max_new_csps_per_cycle', 2)} "
+        f"(only 1 when VIX < 20 — thin premium, deploy slowly)\n"
+        f"Max total CSP collateral: {risk_profile.get('max_collateral_pct', 85)}% of account\n"
         f"Max open CC positions per symbol: {risk_profile.get('max_ccs_per_symbol', 2)}\n"
         f"Min cash reserve: {risk_profile.get('min_cash_pct', 40)}% of account\n"
         f"CSP target delta: ~{risk_profile.get('csp_target_delta', 0.30)}\n"

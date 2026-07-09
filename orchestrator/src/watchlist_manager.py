@@ -23,10 +23,17 @@ from .yf_throttle import paced_call
 
 logger = structlog.get_logger()
 
-# Screener sources to query (tried in order, failures silently skipped)
-_SCREENER_SOURCES = ("day_gainers", "most_actives", "day_losers")
+# Screener sources to query (tried in order, failures silently skipped).
+# day_gainers/day_losers removed 2026-07-09: they fed the universe with
+# one-day-spike small caps (all realized momentum losses came from them) and
+# their extreme moves made Pass 1 misread calm markets as HIGH_VOLATILITY.
+_SCREENER_SOURCES = ("most_actives",)
 MAX_SCREENER_PER_SOURCE = 8   # symbols per screener source
 MAX_SUGGESTIONS = 12          # LLM suggestions to carry forward
+
+# Quality gate for screener candidates (core/LLM/research symbols are exempt)
+MIN_SCREENER_PRICE = 10.0
+MIN_SCREENER_MARKET_CAP = 2e9
 
 # Index / volatility symbols that can't be directly traded
 _EXCLUDE_SYMBOLS = frozenset({"^GSPC", "^DJI", "^IXIC", "^RUT", "^VIX", "^TNX",
@@ -123,16 +130,22 @@ class WatchlistManager:
 
         for screen in _SCREENER_SOURCES:
             try:
-                data = paced_call(lambda: yf.screen(screen, count=max_per_source * 2), label=f"screen:{screen}")
+                data = paced_call(lambda: yf.screen(screen, count=max_per_source * 3), label=f"screen:{screen}")
                 quotes = data.get("quotes", []) if isinstance(data, dict) else []
                 added = 0
                 for q in quotes:
                     sym = (q.get("symbol") or "").upper().strip()
-                    if sym and sym not in symbols and sym not in _EXCLUDE_SYMBOLS:
-                        symbols.append(sym)
-                        added += 1
-                        if added >= max_per_source:
-                            break
+                    if not sym or sym in symbols or sym in _EXCLUDE_SYMBOLS:
+                        continue
+                    # Quality gate: no sub-$10 or micro-cap spike names
+                    price = q.get("regularMarketPrice") or 0
+                    mcap = q.get("marketCap") or 0
+                    if price < MIN_SCREENER_PRICE or (mcap and mcap < MIN_SCREENER_MARKET_CAP):
+                        continue
+                    symbols.append(sym)
+                    added += 1
+                    if added >= max_per_source:
+                        break
                 logger.debug("screener_ok", screen=screen, found=added)
             except Exception as e:
                 logger.debug("screener_failed", screen=screen, error=str(e))

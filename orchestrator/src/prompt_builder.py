@@ -18,11 +18,19 @@ def build_pass1_messages(
     earnings_text: str = "",
     fundamentals_text: str = "",
     research_brief: dict | None = None,
+    regime_text: str = "",
+    journal_text: str = "",
 ) -> list[dict[str, str]]:
     """Build messages for Pass 1: Market Analysis.
 
     The model analyzes market conditions and portfolio health WITHOUT making trades.
     """
+    regime_rule = (
+        "- The market regime is COMPUTED BY THE SYSTEM from hard data and given below. "
+        "Copy it verbatim into market_regime; explain its implications, do not re-classify.\n"
+        if regime_text else
+        "- Assess the overall market regime (bull, bear, sideways, high volatility).\n"
+    )
     system_prompt = (
         "You are a senior financial analyst. Your job is to analyze current market "
         "conditions, portfolio health, and identify opportunities and threats.\n\n"
@@ -30,7 +38,7 @@ def build_pass1_messages(
         "- Do NOT recommend specific trades yet. Only analyze.\n"
         "- Be specific and data-driven in your analysis.\n"
         "- Consider both technical indicators and fundamental news.\n"
-        "- Assess the overall market regime (bull, bear, sideways, high volatility).\n"
+        f"{regime_rule}"
         "- Evaluate portfolio diversification and risk concentration.\n"
         "- For HELD positions: assess whether to stay (fundamental thesis intact?) "
         "or exit (earnings miss, analyst downgrades, thesis broken?).\n"
@@ -81,10 +89,16 @@ def build_pass1_messages(
                 div = float(data.get("div_yield") or 0) or None
             except (TypeError, ValueError):
                 div = None
-            if pe:
+            if pe and 0 < pe < 500:
                 extras.append(f"P/E:{pe:.1f}")
+            # yfinance >= 0.2.x returns dividendYield already in percent (2.54 = 2.54%).
+            # Anything above 15% is almost certainly corrupt data — omit rather than
+            # feed a garbage metric to a value strategy (flagged, not silently fixed).
             if div:
-                extras.append(f"Yield:{div*100:.1f}%")
+                if 0 < div <= 15:
+                    extras.append(f"Yield:{div:.2f}%")
+                else:
+                    extras.append("Yield:N/A(suspect data)")
             if short_pct and short_pct > 0.05:  # only show if >5% (meaningful)
                 extras.append(f"Short:{short_pct*100:.1f}%")
             extras_str = f" | {', '.join(extras)}" if extras else ""
@@ -116,6 +130,10 @@ def build_pass1_messages(
     user_parts = [
         f"== TODAY: {today} ==",
         "",
+    ]
+    if regime_text:
+        user_parts += [regime_text, ""]
+    user_parts += [
         portfolio.to_prompt_text(),
         "",
         market_text,
@@ -135,6 +153,10 @@ def build_pass1_messages(
     user_parts += [
         "",
         decision_history,
+    ]
+    if journal_text:
+        user_parts += ["", journal_text]
+    user_parts += [
         "",
         strategy_text,
         "",
@@ -223,13 +245,13 @@ def build_pass2_messages(
             "- Do NOT buy if RSI > 70 (overbought) without an extraordinary fundamental discount.\n"
         )
 
-    buying_power = max(0, portfolio.cash - portfolio.total_value * min_cash_pct / 100)
+    buying_power = max(0, portfolio.available_cash - portfolio.total_value * min_cash_pct / 100)
 
     if buying_power <= 0:
         # Show how much could be freed by selling
         total_sellable = sum(p.market_value for p in portfolio.positions)
         system_prompt += (
-            f"\n⚠ HARD CONSTRAINT: buying power is $0 (cash ${portfolio.cash:,.2f} "
+            f"\n⚠ HARD CONSTRAINT: buying power is $0 (cash ${portfolio.available_cash:,.2f} "
             f"≤ ${portfolio.total_value * min_cash_pct / 100:,.2f} reserve).\n"
             f"However, you CAN sell positions first to free up cash. "
             f"Total sellable: ${total_sellable:,.2f}. "
@@ -266,7 +288,7 @@ def build_pass2_messages(
 
     if buying_power <= 0:
         constraints_lines.append(
-            f"⚠ NO BUY BUDGET — cash ${portfolio.cash:,.2f} is below "
+            f"⚠ NO BUY BUDGET — cash ${portfolio.available_cash:,.2f} is below "
             f"${min_reserve:,.2f} min reserve. Only SELL or HOLD allowed."
         )
     else:
@@ -413,6 +435,44 @@ def format_decision_history(history: list[dict], max_entries: int = 4) -> str:
     return "\n".join(lines)
 
 
+def format_trade_journal(trades: list[dict], spy_return_pct: float | None = None) -> str:
+    """Format closed trades with realized P/L for prompt injection.
+
+    Framed as diagnostic data with an explicit anti-recency rule: at n<20 the
+    win rate is statistical noise, and LLMs otherwise flip risk appetite after
+    a couple of losses — the exact paralysis this system is being cured of.
+    """
+    if not trades:
+        return ""
+
+    wins = sum(1 for t in trades if (t.get("realized_pl") or 0) > 0)
+    total_pl = sum(t.get("realized_pl") or 0 for t in trades)
+    lines = [
+        "== CLOSED TRADES — REALIZED RESULTS (diagnostic data) ==",
+        f"Last {len(trades)} closed trades: {wins} wins / {len(trades) - wins} losses, "
+        f"net realized P/L ${total_pl:+,.2f}",
+    ]
+    if spy_return_pct is not None:
+        lines.append(
+            f"Benchmark context: SPY moved {spy_return_pct:+.1f}% over the last 30 days — "
+            "judge these results against the market, not in isolation."
+        )
+    for t in trades:
+        held = f", held {t['held_days']}d" if t.get("held_days") is not None else ""
+        lines.append(
+            f"  [{t.get('close_date', '?')}] {t.get('symbol', '?')}: "
+            f"entry ${t.get('entry_price', 0):.2f} → exit ${t.get('exit_price', 0):.2f}, "
+            f"P/L ${t.get('realized_pl', 0):+,.2f} ({t.get('realized_pl_pct', 0):+.1f}%){held}"
+        )
+    lines.append(
+        "INTERPRETATION RULES: this sample is too small to change your risk appetite "
+        "(win-rate confidence interval at n<20 is ±30pp). Do NOT turn defensive after "
+        "a few losses or overconfident after a few wins. Look ONLY for repeatable "
+        "error patterns (e.g. selling too early, buying after a spike, ignoring the trend)."
+    )
+    return "\n".join(lines)
+
+
 def build_bull_bear_messages(
     analysis_json: dict,
     portfolio: PortfolioState,
@@ -434,7 +494,7 @@ def build_bull_bear_messages(
     max_position_pct = risk_profile.get("max_position_pct", 20)
     min_cash_pct = risk_profile.get("min_cash_pct", 10)
     max_position_usd = portfolio.total_value * max_position_pct / 100
-    buying_power = max(0, portfolio.cash - portfolio.total_value * min_cash_pct / 100)
+    buying_power = max(0, portfolio.available_cash - portfolio.total_value * min_cash_pct / 100)
 
     if side == "bull":
         bias = (
@@ -503,6 +563,7 @@ def build_synthesis_messages(
     portfolio: PortfolioState,
     strategy_config: dict,
     risk_profile: dict,
+    journal_text: str = "",
 ) -> list[dict[str, str]]:
     """Build synthesis prompt that combines bull and bear arguments into final decision."""
     import json
@@ -532,7 +593,8 @@ def build_synthesis_messages(
         "- CHOOSE the strongest 1-2 actions total. Fewer trades > more trades.\n"
         "- If bull and bear disagree on a symbol, that symbol should probably be HELD.\n"
         "- Explain WHY you rejected the losing side's argument with specific evidence.\n\n"
-        "REGIME-ADJUSTED AGGRESSION:\n"
+        "REGIME-ADJUSTED AGGRESSION (the regime below is computed by the system from "
+        "hard data — VIX and SPY trend. It is authoritative; do not second-guess it):\n"
         "- In HIGH_VOLATILITY or BEAR_TREND: default to DEFENSIVE posture. Cash is a position.\n"
         "  Net new BUYs require confidence ≥ 0.85 AND strong technical + fundamental alignment.\n"
         "  Prefer: trim overweight → raise cash → wait for better entry.\n"
@@ -544,6 +606,8 @@ def build_synthesis_messages(
         "  Sitting on >40% cash in a bullish regime is a drag on performance.\n"
         "- If cash > 40% AND regime is HIGH_VOLATILITY/BEAR_TREND:\n"
         "  Hold cash — this is correct defensive positioning. Do NOT force trades.\n\n"
+        "CASH PARKING: idle cash is swept into T-bills automatically by the system.\n"
+        "Do NOT propose BIL or SGOV trades — parking is not your job.\n\n"
         "RULES:\n"
         f"- Max {max_trades} trades per cycle\n"
         f"- No position > {max_position_pct}% (=${max_position_usd:,.0f})\n"
@@ -578,7 +642,7 @@ def build_synthesis_messages(
         f"== MARKET CONTEXT ==\n"
         f"Regime: {analysis_json.get('market_regime', 'Unknown')}\n"
         f"Regime reasoning: {analysis_json.get('regime_reasoning', 'N/A')}\n"
-        f"Cash: ${portfolio.cash:,.2f} ({portfolio.cash_pct:.1f}%)\n\n"
+        f"Cash: ${portfolio.available_cash:,.2f} ({portfolio.cash_pct:.1f}%)\n\n"
         f"{portfolio.to_prompt_text()}\n\n"
         f"== BULL CASE (confidence: {bull_case.get('confidence', '?')}) ==\n"
         f"Thesis: {bull_case.get('thesis', 'N/A')}\n"
@@ -588,6 +652,7 @@ def build_synthesis_messages(
         f"Thesis: {bear_case.get('thesis', 'N/A')}\n"
         f"Proposed trades: {json.dumps(bear_case.get('actions', []), indent=2)}\n"
         f"Risks if wrong: {json.dumps(bear_case.get('key_risks', []))}\n\n"
+        f"{journal_text + chr(10) + chr(10) if journal_text else ''}"
         "Synthesize both cases and make your final trading decision."
     )
 

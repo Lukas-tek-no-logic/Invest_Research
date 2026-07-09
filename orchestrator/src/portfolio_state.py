@@ -11,6 +11,11 @@ from .ghostfolio_client import GhostfolioClient
 
 logger = structlog.get_logger()
 
+# Cash-equivalent ETFs (T-bills). These are a mechanical cash parking lot, not
+# an investment position: they are split out of `positions`, folded into
+# `available_cash`, and never shown to the LLM as holdings.
+CASH_EQUIVALENT_SYMBOLS = {"BIL", "SGOV"}
+
 
 class ValuationUnavailable(RuntimeError):
     """Ghostfolio valuation could not be fetched or built — do not trade.
@@ -47,12 +52,23 @@ class PortfolioState:
     total_pl_pct: float = 0.0
     sector_weights: dict[str, float] = field(default_factory=dict)
     timestamp: str = ""
+    # T-bill parking positions (BIL/SGOV) — excluded from `positions`, treated as cash
+    cash_equivalents: list[Position] = field(default_factory=list)
+
+    @property
+    def cash_equivalent_value(self) -> float:
+        return sum(p.market_value for p in self.cash_equivalents)
+
+    @property
+    def available_cash(self) -> float:
+        """Spendable cash: raw balance + T-bill parking (auto-liquidated on demand)."""
+        return self.cash + self.cash_equivalent_value
 
     @property
     def cash_pct(self) -> float:
         if self.total_value <= 0:
             return 100.0
-        return (self.cash / self.total_value) * 100
+        return (self.available_cash / self.total_value) * 100
 
     @property
     def position_count(self) -> int:
@@ -77,6 +93,7 @@ class PortfolioState:
             total_pl_pct=self.total_pl_pct,
             sector_weights=self.sector_weights,
             timestamp=self.timestamp,
+            cash_equivalents=self.cash_equivalents,
         )
 
     def to_prompt_text(self) -> str:
@@ -84,7 +101,7 @@ class PortfolioState:
         lines = [
             f"== PORTFOLIO STATE ({self.account_name}) ==",
             f"Total Value: ${self.total_value:,.2f}",
-            f"Cash: ${self.cash:,.2f} ({self.cash_pct:.1f}%)",
+            f"Cash: ${self.available_cash:,.2f} ({self.cash_pct:.1f}%)",
             f"Invested: ${self.invested:,.2f}",
             f"Total P/L: ${self.total_pl:,.2f} ({self.total_pl_pct:+.2f}%)",
             f"Positions: {self.position_count}",
@@ -236,6 +253,7 @@ def get_portfolio_state(
                 agg[sym]["qty"] = max(0, agg[sym]["qty"] - qty)
 
         positions: list[Position] = []
+        cash_equivalents: list[Position] = []
         total_market = 0.0
         total_invested = 0.0
         sector_totals: dict[str, float] = {}
@@ -254,7 +272,7 @@ def get_portfolio_state(
             unrealized_pl_pct = (unrealized_pl / investment * 100) if investment > 0 else 0.0
             sector = info.get("sector", "Unknown")
 
-            positions.append(Position(
+            pos = Position(
                 symbol=sym,
                 name=info.get("name", sym),
                 quantity=qty,
@@ -265,8 +283,14 @@ def get_portfolio_state(
                 unrealized_pl_pct=unrealized_pl_pct,
                 sector=sector,
                 first_buy_date=data.get("first_date"),
-            ))
+            )
             total_market += market_value
+            if sym in CASH_EQUIVALENT_SYMBOLS:
+                # T-bill parking: counts toward total value but is not an
+                # investment position — the LLM sees it as cash.
+                cash_equivalents.append(pos)
+                continue
+            positions.append(pos)
             total_invested += investment
             sector_totals[sector] = sector_totals.get(sector, 0) + market_value
 
@@ -290,7 +314,9 @@ def get_portfolio_state(
             for sector, val in sector_totals.items()
         }
 
-        total_pl = total_market - total_invested
+        # P/L on investment positions only — T-bill parking is cash, not P/L
+        equity_market = total_market - sum(p.market_value for p in cash_equivalents)
+        total_pl = equity_market - total_invested
         total_pl_pct = (total_pl / total_invested * 100) if total_invested > 0 else 0.0
 
         state = PortfolioState(
@@ -304,6 +330,7 @@ def get_portfolio_state(
             total_pl_pct=total_pl_pct,
             sector_weights=sector_weights,
             timestamp=datetime.utcnow().isoformat(),
+            cash_equivalents=cash_equivalents,
         )
 
         logger.info(

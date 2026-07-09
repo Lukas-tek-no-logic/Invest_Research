@@ -21,19 +21,26 @@ from .account_manager import AccountManager
 from .consensus import chat_json_consensus
 from .research_agent import ResearchAgent
 from .audit_logger import AuditLogger
-from .decision_parser import DecisionResult, parse_analysis, parse_decision
+from .decision_parser import DecisionResult, TradeAction, parse_analysis, parse_decision
 from .ghostfolio_client import GhostfolioClient
 from .llm_client import LLMClient
 from .market_data import MarketDataProvider
 from .news_fetcher import NewsFetcher
-from .portfolio_state import get_portfolio_state, compute_cash_from_orders, ValuationUnavailable
+from .portfolio_state import (
+    CASH_EQUIVALENT_SYMBOLS,
+    ValuationUnavailable,
+    compute_cash_from_orders,
+    get_portfolio_state,
+)
 from .prompt_builder import (
     build_pass1_messages,
     build_pass2_messages,
     build_bull_bear_messages,
     build_synthesis_messages,
     format_decision_history,
+    format_trade_journal,
 )
+from .regime import RegimeResult, compute_regime
 from .self_critique import ReflectionEngine
 from .rag_client import RagClient
 from .fundamental_data import format_fundamentals_for_prompt, get_fundamentals_batch
@@ -141,6 +148,119 @@ class Orchestrator:
         """Self-consistency sample count for Pass 2 (account > defaults > 1)."""
         default = self.config.get("defaults", {}).get("pass2_samples", 1)
         return int(acct.get("pass2_samples", default))
+
+    # ── Deterministic market regime ───────────────────────────────────────
+
+    _REGIME_CACHE_TTL = 900  # 15 min — covers the staggered per-account cycles
+    # Class-level defaults so tests constructing Orchestrator without __init__ work
+    _regime_cache: tuple[float, RegimeResult] | None = None
+    _spy_return_cache: tuple[float, float] | None = None
+
+    def _get_regime(self) -> RegimeResult | None:
+        """Compute the market regime from VIX + SPY data (cached 15 min).
+
+        Returns None when data is unavailable — callers fall back to the
+        LLM's own classification (the pre-2026-07-09 behavior).
+        """
+        if self._regime_cache and (time.time() - self._regime_cache[0]) < self._REGIME_CACHE_TTL:
+            return self._regime_cache[1]
+        try:
+            vix_df = self.market_data.get_history("^VIX", period="3mo")
+            spy_df = self.market_data.get_history("SPY", period="1y")
+            result = compute_regime(list(vix_df["Close"]), list(spy_df["Close"]))
+        except Exception as e:
+            logger.warning("deterministic_regime_failed", error=str(e))
+            return None
+        self._regime_cache = (time.time(), result)
+        return result
+
+    def _get_spy_return_30d(self) -> float | None:
+        """SPY % return over ~30 calendar days (benchmark context for the journal)."""
+        if self._spy_return_cache and (time.time() - self._spy_return_cache[0]) < self._REGIME_CACHE_TTL:
+            return self._spy_return_cache[1]
+        try:
+            df = self.market_data.get_history("SPY", period="3mo")
+            closes = list(df["Close"])
+            if len(closes) < 22:
+                return None
+            ret = (closes[-1] / closes[-22] - 1) * 100
+        except Exception as e:
+            logger.warning("spy_return_failed", error=str(e))
+            return None
+        self._spy_return_cache = (time.time(), ret)
+        return ret
+
+    # ── Mechanical cash sweep (idle cash → T-bills, no LLM involved) ──────
+
+    _SWEEP_MIN_USD = 500.0  # dead zone: don't churn small residuals
+    _SWEEP_SYMBOL = "BIL"
+
+    def run_cash_sweep(self, account_key: str | None = None) -> None:
+        """Park idle cash above the reserve into T-bills for equity accounts.
+
+        Runs daily after the trading cycles. The parked position is invisible
+        to the LLM (folded into available_cash); the reverse sweep happens
+        lazily inside run_cycle when an approved trade needs the cash.
+        """
+        self._load_config()
+        accounts = self.config.get("accounts", {})
+        keys = [account_key] if account_key else list(accounts.keys())
+
+        for key in keys:
+            acct = accounts.get(key)
+            if not acct or acct.get("enabled") is False:
+                continue
+            if self._is_options_account(acct) or acct.get("cycle_type") == "research":
+                continue
+            account_id = acct.get("ghostfolio_account_id", "")
+            if not account_id:
+                continue
+            account_name = acct.get("name", key)
+            min_cash_pct = acct.get("risk_profile", {}).get("min_cash_pct", 10)
+
+            try:
+                portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            except ValuationUnavailable as e:
+                logger.warning("cash_sweep_skipped", account=account_name, error=str(e))
+                continue
+
+            reserve = portfolio.total_value * min_cash_pct / 100
+            excess = portfolio.cash - reserve
+            if excess < self._SWEEP_MIN_USD:
+                continue
+
+            action = TradeAction(
+                type="BUY",
+                symbol=self._SWEEP_SYMBOL,
+                amount_usd=round(excess, 2),
+                urgency="LOW",
+                thesis="CASH SWEEP: park idle cash in T-bills (mechanical, no LLM)",
+                exit_condition="Auto-liquidated when cash is needed",
+            )
+            executor = TradeExecutor(
+                self.ghostfolio, self.market_data, dry_run=self.dry_run,
+                broker_cost_model=acct.get("broker_cost_model", ""),
+            )
+            results = executor.execute_trades([action], account_id)
+            ok = any(r.success for r in results)
+            logger.info(
+                "cash_sweep_done" if ok else "cash_sweep_failed",
+                account=account_name,
+                amount=round(excess, 2),
+                error="" if ok else (results[0].error if results else "no result"),
+            )
+            if ok and not self.dry_run:
+                initial_budget = acct.get(
+                    "initial_budget",
+                    self.config.get("defaults", {}).get("initial_budget", 10000),
+                )
+                new_cash = compute_cash_from_orders(self.ghostfolio, account_id, initial_budget)
+                if new_cash is not None:
+                    try:
+                        self.ghostfolio.update_account(account_id, balance=new_cash)
+                    except Exception as e:
+                        logger.warning("cash_sweep_balance_update_failed",
+                                       account=account_name, error=str(e))
 
     def _load_config(self) -> None:
         with open(self.config_path) as f:
@@ -898,6 +1018,21 @@ class Orchestrator:
             except Exception as e:
                 logger.warning("research_brief_load_failed", error=str(e))
 
+            # Deterministic market regime (authoritative; None → LLM fallback)
+            regime_result = self._get_regime()
+            regime_text = regime_result.to_prompt_text() if regime_result else ""
+
+            # Feedback loop: post-baseline closed trades + SPY benchmark context
+            journal_text = ""
+            try:
+                journal_trades = self.audit.get_trade_journal(account_key, limit=10)
+                if journal_trades:
+                    journal_text = format_trade_journal(
+                        journal_trades, self._get_spy_return_30d()
+                    )
+            except Exception as e:
+                logger.warning("trade_journal_load_failed", error=str(e))
+
             # ===== PHASE 2-3: DECISION (rules engine OR LLM) =====
             decision_mode = acct.get("decision_mode", "llm")
 
@@ -1006,6 +1141,8 @@ class Orchestrator:
                     earnings_text=earnings_text,
                     fundamentals_text=fundamentals_text,
                     research_brief=research_brief,
+                    regime_text=regime_text,
+                    journal_text=journal_text,
                 )
 
                 analysis_raw = self.llm.chat_json(
@@ -1015,6 +1152,15 @@ class Orchestrator:
                     temperature=0.7,
                 )
                 analysis = parse_analysis(analysis_raw)
+                # The deterministic regime is authoritative — override whatever
+                # the LLM echoed (or hallucinated) before anything consumes it.
+                if regime_result:
+                    analysis_raw["_llm_regime"] = analysis_raw.get("market_regime")
+                    analysis_raw["market_regime"] = regime_result.regime
+                    analysis_raw["regime_reasoning"] = (
+                        f"[deterministic] {regime_result.reasoning}"
+                    )
+                    analysis.market_regime = regime_result.regime
                 logger.info(
                     "analysis_complete",
                     regime=analysis.market_regime,
@@ -1088,6 +1234,7 @@ class Orchestrator:
                     portfolio=portfolio,
                     strategy_config=acct,
                     risk_profile=risk_profile,
+                    journal_text=journal_text,
                 )
                 decision_raw = chat_json_consensus(
                     self.llm, messages=synthesis_messages, model=model,
@@ -1115,6 +1262,8 @@ class Orchestrator:
                 decision=decision,
                 portfolio=portfolio,
                 quotes={s: q for s, q in quotes.items()},
+                regime=regime_result.regime if regime_result else None,
+                core_symbols=acct.get("watchlist", []),
             )
 
             for w in risk_result.warnings:
@@ -1140,6 +1289,29 @@ class Orchestrator:
             else:
                 all_actions = all_candidates
             executed_trades = []
+
+            # Lazy sweep-out: fund approved buys from T-bill parking when the
+            # raw cash balance is short (available_cash includes the parking).
+            if all_actions:
+                buys_total = sum(a.amount_usd for a in all_actions if a.type == "BUY")
+                sells_total = sum(a.amount_usd for a in all_actions if a.type == "SELL")
+                cash_shortfall = buys_total - sells_total - portfolio.cash
+                if cash_shortfall > 0 and portfolio.cash_equivalent_value > 0:
+                    unpark = min(
+                        cash_shortfall + 25,  # small buffer for fees
+                        portfolio.cash_equivalent_value,
+                    )
+                    all_actions.insert(0, TradeAction(
+                        type="SELL",
+                        symbol=self._SWEEP_SYMBOL,
+                        amount_usd=round(unpark, 2),
+                        urgency="HIGH",
+                        thesis="CASH SWEEP-OUT: liquidate T-bill parking to fund approved trades",
+                        exit_condition="Mechanical",
+                    ))
+                    risk_result.modifications.append(
+                        f"CASH SWEEP-OUT: selling ${unpark:,.0f} {self._SWEEP_SYMBOL} to fund buys"
+                    )
 
             if all_actions:
                 logger.info(
@@ -1177,6 +1349,20 @@ class Orchestrator:
                             price=r.unit_price,
                             fee=r.fee,
                         )
+                        # Feedback loop: record realized result of closed positions
+                        # (T-bill parking is cash management, not a trade result)
+                        if r.action.type == "SELL" and r.action.symbol not in CASH_EQUIVALENT_SYMBOLS:
+                            pos = portfolio.get_position(r.action.symbol)
+                            if pos and pos.avg_cost > 0:
+                                self.audit.log_closed_trade(
+                                    account_key=account_key,
+                                    symbol=r.action.symbol,
+                                    quantity=r.quantity,
+                                    entry_price=pos.avg_cost,
+                                    exit_price=r.unit_price,
+                                    entry_date=pos.first_buy_date,
+                                    thesis=r.action.thesis,
+                                )
                     else:
                         logger.error("trade_failed", symbol=r.action.symbol, error=r.error)
 
@@ -1484,6 +1670,13 @@ class Orchestrator:
                     messages=pass1_messages, model=model,
                     fallback_model=fallback, temperature=0.7,
                 )
+                regime_result = self._get_regime()
+                if regime_result:
+                    analysis_raw["_llm_regime"] = analysis_raw.get("market_regime")
+                    analysis_raw["market_regime"] = regime_result.regime
+                    analysis_raw["regime_reasoning"] = (
+                        f"[deterministic] {regime_result.reasoning}"
+                    )
                 logger.info(
                     "spreads_analysis_complete",
                     regime=analysis_raw.get("market_regime"),
@@ -1856,6 +2049,13 @@ class Orchestrator:
                     messages=pass1_messages, model=model,
                     fallback_model=fallback, temperature=0.7,
                 )
+                regime_result = self._get_regime()
+                if regime_result:
+                    analysis_raw["_llm_regime"] = analysis_raw.get("market_regime")
+                    analysis_raw["market_regime"] = regime_result.regime
+                    analysis_raw["regime_reasoning"] = (
+                        f"[deterministic] {regime_result.reasoning}"
+                    )
                 logger.info(
                     "options_analysis_complete",
                     regime=analysis_raw.get("market_regime"),
@@ -1892,12 +2092,14 @@ class Orchestrator:
             logger.info("options_phase4_risk", account=account_name)
 
             risk_mgr = OptionsRiskManager(risk_profile)
+            regime_for_options = self._get_regime()
             risk_result = risk_mgr.validate(
                 decision=options_decision,
                 active_positions=active_positions,
                 portfolio=portfolio,
                 portfolio_greeks=portfolio_greeks,
                 market_data=market_data,
+                vix=regime_for_options.vix if regime_for_options else None,
             )
 
             for w in risk_result.warnings:
@@ -2126,6 +2328,16 @@ def main():
         misfire_grace_time=1800,
     )
     logger.info("scheduler_options_maintenance_added", cron="0 17 * * *")
+
+    # Daily cash sweep (20:50 — after all equity cycles): park idle cash in T-bills
+    scheduler.add_job(
+        orch.run_cash_sweep,
+        trigger=CronTrigger(hour=20, minute=50, timezone="Europe/Warsaw"),
+        id="cash_sweep",
+        name="Daily cash sweep (idle cash → BIL)",
+        misfire_grace_time=3600,
+    )
+    logger.info("scheduler_cash_sweep_added", cron="50 20 * * *")
 
     # Weekly self-critique reflection (Sunday 19:00 — before weekly trading cycles)
     scheduler.add_job(

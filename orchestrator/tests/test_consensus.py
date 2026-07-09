@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from orchestrator.src.consensus import chat_json_consensus, merge_decision_samples
+from src.consensus import chat_json_consensus, merge_decision_samples
 
 
 def _sample(actions: list[dict], confidence: float = 0.7, **extra) -> dict:

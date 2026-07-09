@@ -83,6 +83,92 @@ class AuditLogger:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS trade_journal (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    account_key TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    quantity REAL NOT NULL,
+                    entry_price REAL NOT NULL,
+                    exit_price REAL NOT NULL,
+                    realized_pl REAL NOT NULL,
+                    realized_pl_pct REAL,
+                    entry_date TEXT,
+                    close_date TEXT NOT NULL,
+                    thesis TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+
+    def log_closed_trade(
+        self,
+        account_key: str,
+        symbol: str,
+        quantity: float,
+        entry_price: float,
+        exit_price: float,
+        entry_date: str | None,
+        thesis: str = "",
+    ) -> None:
+        """Record a closed (sold) position's realized result for the feedback loop."""
+        realized_pl = (exit_price - entry_price) * quantity
+        realized_pl_pct = (
+            (exit_price / entry_price - 1) * 100 if entry_price > 0 else 0.0
+        )
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute(
+                    """INSERT INTO trade_journal
+                       (account_key, symbol, quantity, entry_price, exit_price,
+                        realized_pl, realized_pl_pct, entry_date, close_date, thesis)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        account_key, symbol, quantity, entry_price, exit_price,
+                        realized_pl, realized_pl_pct, entry_date,
+                        datetime.now().strftime("%Y-%m-%d"), thesis[:300],
+                    ),
+                )
+            logger.info(
+                "trade_journal_recorded",
+                account=account_key, symbol=symbol, realized_pl=round(realized_pl, 2),
+            )
+        except Exception as e:
+            logger.warning("trade_journal_write_failed", symbol=symbol, error=str(e))
+
+    def get_trade_journal(
+        self,
+        account_key: str,
+        limit: int = 10,
+        since: str = "2026-07-09",
+    ) -> list[dict]:
+        """Recent closed trades for an account (post-baseline only — older
+        history has known-corrupt P/L and must not feed the model)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                rows = conn.execute(
+                    """SELECT symbol, quantity, entry_price, exit_price, realized_pl,
+                              realized_pl_pct, entry_date, close_date
+                       FROM trade_journal
+                       WHERE account_key = ? AND close_date >= ?
+                       ORDER BY id DESC LIMIT ?""",
+                    (account_key, since, limit),
+                ).fetchall()
+            trades = []
+            for r in rows:
+                t = dict(r)
+                try:
+                    if t.get("entry_date") and t.get("close_date"):
+                        d1 = datetime.fromisoformat(str(t["entry_date"])[:10])
+                        d2 = datetime.fromisoformat(str(t["close_date"])[:10])
+                        t["held_days"] = (d2 - d1).days
+                except (ValueError, TypeError):
+                    t["held_days"] = None
+                trades.append(t)
+            return trades
+        except Exception as e:
+            logger.warning("trade_journal_read_failed", account=account_key, error=str(e))
+            return []
 
     def log_cycle(
         self,

@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 import structlog
 
 from .decision_parser import TradeAction, DecisionResult
-from .portfolio_state import PortfolioState
+from .portfolio_state import PortfolioState, CASH_EQUIVALENT_SYMBOLS
 from .market_data import StockQuote
 from .transaction_costs import calculate_cost
 
@@ -18,9 +18,12 @@ MIN_PRICE = 5.0
 MIN_AVG_DAILY_VOLUME_USD = 100_000
 MAX_PORTFOLIO_DRAWDOWN_PCT = -20.0
 
-# Cash-equivalent ETFs (T-bills): exempt from max_position_pct so idle cash
-# can be parked in full — a 40%-cash account should be able to park 40%.
-CASH_EQUIVALENT_SYMBOLS = {"BIL", "SGOV"}
+# Minimum invested percentage per market regime. The mirror image of the max
+# limits: nothing used to protect the account from UNDER-exposure, so LLM
+# defensiveness left 40-100% of capital idle through a bull market. Enforced
+# like any other hard limit; HIGH_VOLATILITY/BEAR_TREND have no floor.
+EXPOSURE_FLOOR_PCT = {"BULL_TREND": 60.0, "SIDEWAYS": 40.0}
+FLOOR_TOPUP_MIN_USD = 50.0
 
 # Pairs of highly correlated assets (buying both in same cycle is redundant)
 CORRELATED_PAIRS = [
@@ -67,6 +70,7 @@ class RiskManager:
         self.min_holding_hours = risk_profile.get("min_holding_hours", 0)
         self.min_order_usd = risk_profile.get("min_order_usd", 0)
         self.max_sector_exposure_pct = risk_profile.get("max_sector_exposure_pct", 40)
+        self.exposure_floor_pct = risk_profile.get("exposure_floor_pct", EXPOSURE_FLOOR_PCT)
         self._sim_date = sim_date  # None = use datetime.now()
 
     def validate(
@@ -75,6 +79,8 @@ class RiskManager:
         portfolio: PortfolioState,
         quotes: dict[str, StockQuote],
         order_history: list[dict] | None = None,
+        regime: str | None = None,
+        core_symbols: list[str] | None = None,
     ) -> RiskManagerResult:
         """Run all risk checks on the decision.
 
@@ -148,14 +154,32 @@ class RiskManager:
                 f"SKIPPED {action.type} {action.symbol}: already covered by forced stop-loss"
             )
 
+        # Exposure floor: minimum invested % per regime (0 = no floor).
+        # Forced sells (stop-loss, zombie, drawdown) are never blocked by it.
+        floor_pct = float((self.exposure_floor_pct or {}).get(regime, 0) or 0) if regime else 0.0
+        floor_value = portfolio.total_value * floor_pct / 100
+        equity_value = sum(p.market_value for p in portfolio.positions)
+        projected_equity = equity_value - sum(
+            a.amount_usd for a in result.forced_actions if a.type == "SELL"
+        )
+
         validated = []
         # Track cash freed by approved sells (including forced) for buy validation
         freed_cash = sum(a.amount_usd for a in result.forced_actions if a.type == "SELL")
         for action in sells:
             check = self._validate_action(action, portfolio, quotes, order_history)
+            if check.approved and floor_value > 0 and \
+                    projected_equity - check.action.amount_usd < floor_value:
+                check.approved = False
+                check.rejection_reason = (
+                    f"SELL would drop invested below {floor_pct:.0f}% exposure floor "
+                    f"for {regime} (${projected_equity - check.action.amount_usd:,.0f} "
+                    f"< ${floor_value:,.0f})"
+                )
             if check.approved:
                 validated.append(check)
                 freed_cash += check.action.amount_usd
+                projected_equity -= check.action.amount_usd
             else:
                 result.rejected_actions.append(check)
                 result.modifications.append(
@@ -169,7 +193,7 @@ class RiskManager:
             adjusted_portfolio = portfolio.with_extra_cash(freed_cash)
             result.warnings.append(
                 f"Sell-then-buy: ${freed_cash:,.0f} freed from sells, "
-                f"effective buying power: ${max(0, adjusted_portfolio.cash - adjusted_portfolio.total_value * self.min_cash_pct / 100):,.0f}"
+                f"effective buying power: ${max(0, adjusted_portfolio.available_cash - adjusted_portfolio.total_value * self.min_cash_pct / 100):,.0f}"
             )
         else:
             adjusted_portfolio = portfolio
@@ -205,6 +229,55 @@ class RiskManager:
             result.modifications.append(
                 f"REJECTED {check.action.type} {check.action.symbol}: max trades exceeded"
             )
+
+        # Exposure floor top-up: if the account would still sit below the
+        # regime's minimum invested %, mechanically buy core ETFs up to the
+        # floor (spread across core symbols to respect per-position caps).
+        if floor_value > 0 and core_symbols:
+            approved_buy_by_sym: dict[str, float] = {}
+            for a in result.approved_actions:
+                if a.type == "BUY" and a.symbol not in CASH_EQUIVALENT_SYMBOLS:
+                    approved_buy_by_sym[a.symbol] = (
+                        approved_buy_by_sym.get(a.symbol, 0) + a.amount_usd
+                    )
+            buys_total = sum(approved_buy_by_sym.values())
+            proj_equity_final = projected_equity + buys_total
+            min_reserve = portfolio.total_value * self.min_cash_pct / 100
+            cash_avail = portfolio.available_cash + freed_cash - buys_total - min_reserve
+            shortfall = floor_value - proj_equity_final
+            budget = min(shortfall, cash_avail)
+
+            if budget > FLOOR_TOPUP_MIN_USD:
+                max_position_value = portfolio.total_value * self.max_position_pct / 100
+                for sym in core_symbols:
+                    if budget <= FLOOR_TOPUP_MIN_USD:
+                        break
+                    if sym in CASH_EQUIVALENT_SYMBOLS:
+                        continue
+                    existing = portfolio.get_position(sym)
+                    existing_val = existing.market_value if existing else 0.0
+                    room = max_position_value - existing_val - approved_buy_by_sym.get(sym, 0)
+                    amount = min(budget, room)
+                    if amount < FLOOR_TOPUP_MIN_USD:
+                        continue
+                    result.forced_actions.append(TradeAction(
+                        type="BUY",
+                        symbol=sym,
+                        amount_usd=amount,
+                        urgency="MEDIUM",
+                        thesis=(
+                            f"EXPOSURE FLOOR: invested ${proj_equity_final:,.0f} "
+                            f"< {floor_pct:.0f}% floor (${floor_value:,.0f}) in {regime} — "
+                            f"mechanical top-up into core ETF"
+                        ),
+                        exit_condition="Managed by strategy cycles",
+                    ))
+                    budget -= amount
+                    proj_equity_final += amount
+                result.warnings.append(
+                    f"EXPOSURE FLOOR ({regime}): topped up to ${proj_equity_final:,.0f} "
+                    f"invested (floor ${floor_value:,.0f} = {floor_pct:.0f}%)"
+                )
 
         logger.info(
             "risk_validation_complete",
@@ -259,14 +332,15 @@ class RiskManager:
     ) -> RiskCheckResult:
         """Validate a BUY action."""
         min_cash = portfolio.total_value * self.min_cash_pct / 100
-        max_investable = max(0, portfolio.cash - min_cash)
+        # available_cash includes T-bill parking (auto-liquidated before buys)
+        max_investable = max(0, portfolio.available_cash - min_cash)
 
         # Rule: Cash after BUY >= min_cash_pct
         if action.amount_usd > max_investable:
             if max_investable <= 0:
                 check.approved = False
                 check.rejection_reason = (
-                    f"Insufficient cash. Available: ${portfolio.cash:,.2f}, "
+                    f"Insufficient cash. Available: ${portfolio.available_cash:,.2f}, "
                     f"min reserve: ${min_cash:,.2f}"
                 )
                 return check
