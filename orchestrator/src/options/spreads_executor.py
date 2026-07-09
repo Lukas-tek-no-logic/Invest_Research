@@ -57,6 +57,7 @@ class SpreadsExecutor:
         risk_profile: dict,
         dry_run: bool = False,
         account_key: str | None = None,
+        cash_available: float | None = None,
     ):
         self.ghostfolio = ghostfolio
         self.market_data = market_data
@@ -65,6 +66,11 @@ class SpreadsExecutor:
         self.account_key = account_key or account_id
         self.risk_profile = risk_profile
         self.dry_run = dry_run
+        # Post-selection affordability budget: the risk manager pre-approves
+        # opens with a crude width-based max-loss proxy; once the selector
+        # returns the REAL max_loss we re-check it here. Decremented across
+        # opens within one cycle. None = check disabled.
+        self._cash_available = cash_available
 
     # -- Public interface --
 
@@ -147,6 +153,27 @@ class SpreadsExecutor:
                     spread_type=action.spread_type, position_id=None,
                     success=False, error="Spread selection failed (no suitable chain/strikes)",
                 )
+
+            # Affordability re-check with the selector's REAL max_loss (the risk
+            # manager only saw a width-based upper-bound proxy).
+            if self._cash_available is not None and spread.max_loss > self._cash_available:
+                logger.warning(
+                    "spread_open_rejected_max_loss",
+                    symbol=action.symbol, spread_type=action.spread_type,
+                    max_loss=spread.max_loss,
+                    cash_available=round(self._cash_available, 2),
+                )
+                return SpreadsTradeResult(
+                    action="OPEN_SPREAD", symbol=action.symbol,
+                    spread_type=action.spread_type, position_id=None,
+                    success=False,
+                    error=(
+                        f"Real max loss ${spread.max_loss:,.0f} exceeds remaining "
+                        f"cash budget ${self._cash_available:,.0f}"
+                    ),
+                )
+            if self._cash_available is not None:
+                self._cash_available -= spread.max_loss
 
             # Determine buy/sell legs for DB storage
             # For multi-leg spreads, store the primary buy and sell legs
@@ -374,14 +401,35 @@ class SpreadsExecutor:
             entry_debit = pos.entry_debit or 0
             all_legs = self.tracker.get_legs(pos.id)
 
+            # Spot price for intrinsic-value fallback when a leg quote is missing —
+            # one illiquid leg must not freeze the whole position's P/L (that would
+            # silently disable mark-based take-profit/stop-loss between cycles).
+            try:
+                spot = float(self.market_data.get_current_price(pos.symbol) or 0) or None
+            except Exception:
+                spot = None
+
+            def _leg_price(option_type: str, strike: float) -> float | None:
+                price = get_current_option_price(
+                    pos.symbol, option_type, strike, pos.expiration_date,
+                )
+                if price is None and spot:
+                    price = (max(spot - strike, 0.0) if option_type == "call"
+                             else max(strike - spot, 0.0))
+                    logger.warning(
+                        "spread_leg_stale_price_intrinsic_fallback",
+                        pos_id=pos.id, symbol=pos.symbol,
+                        option_type=option_type, strike=strike,
+                        spot=round(spot, 2), intrinsic=round(price, 2),
+                    )
+                return price
+
             if all_legs:
                 # Multi-leg pricing: net value = Σ(leg_price * sign)
                 # buy legs are assets (positive), sell legs are liabilities (negative)
                 net_value = 0.0
                 for leg in all_legs:
-                    leg_price = get_current_option_price(
-                        pos.symbol, leg.option_type, leg.strike, pos.expiration_date,
-                    )
+                    leg_price = _leg_price(leg.option_type, leg.strike)
                     if leg_price is None:
                         return SpreadsTradeResult(
                             action="UPDATE", symbol=pos.symbol,
@@ -394,12 +442,8 @@ class SpreadsExecutor:
                 current_value = round(net_value, 2)
             elif (pos.buy_strike or 0) > 0:
                 # Legacy 2-leg fallback (positions opened before options_legs table)
-                buy_price = get_current_option_price(
-                    pos.symbol, pos.buy_option_type, pos.buy_strike, pos.expiration_date,
-                )
-                sell_price = get_current_option_price(
-                    pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
-                )
+                buy_price = _leg_price(pos.buy_option_type, pos.buy_strike)
+                sell_price = _leg_price(pos.sell_option_type, pos.sell_strike)
                 if buy_price is None or sell_price is None:
                     return SpreadsTradeResult(
                         action="UPDATE", symbol=pos.symbol,
@@ -411,9 +455,7 @@ class SpreadsExecutor:
             else:
                 # Single-leg (CSP/CC): sell leg only. Negate to the signed
                 # convention — a short option is a liability we pay to close.
-                leg_price = get_current_option_price(
-                    pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
-                )
+                leg_price = _leg_price(pos.sell_option_type, pos.sell_strike)
                 if leg_price is None:
                     return SpreadsTradeResult(
                         action="UPDATE", symbol=pos.symbol,

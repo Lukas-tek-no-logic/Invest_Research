@@ -8,7 +8,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -25,7 +25,7 @@ from .ghostfolio_client import GhostfolioClient
 from .llm_client import LLMClient
 from .market_data import MarketDataProvider
 from .news_fetcher import NewsFetcher
-from .portfolio_state import get_portfolio_state, compute_cash_from_orders
+from .portfolio_state import get_portfolio_state, compute_cash_from_orders, ValuationUnavailable
 from .prompt_builder import (
     build_pass1_messages,
     build_pass2_messages,
@@ -91,6 +91,51 @@ class Orchestrator:
         # Per-account cache of prices from the last intraday cycle (for Pass 0 delta)
         self._last_cycle_prices: dict[str, dict[str, float]] = {}
 
+        # Set by main() when running under the scheduler; enables cycle retries
+        self.scheduler: BlockingScheduler | None = None
+        self._retry_attempts: dict[str, int] = {}
+
+    # ── Cycle retry on valuation outage ──────────────────────────────────
+
+    _MAX_CYCLE_RETRIES = 3
+    _RETRY_DELAY_MINUTES = 30
+
+    def _schedule_retry(self, cycle_name: str, fn, account_key: str) -> None:
+        """Schedule a one-shot retry of a cycle that aborted on ValuationUnavailable.
+
+        Safe to call multiple times: the deterministic job id + replace_existing
+        guarantee at most one pending retry per (cycle, account). Retries only
+        fire for ValuationUnavailable, which is raised before any trade executes,
+        so a retry can never double-execute trades.
+        """
+        job_id = f"retry_{cycle_name}_{account_key}"
+        if self.scheduler is None:
+            logger.info("cycle_retry_unavailable", job=job_id, reason="no scheduler (one-off mode)")
+            return
+        attempt = self._retry_attempts.get(job_id, 0) + 1
+        if attempt > self._MAX_CYCLE_RETRIES:
+            logger.warning("cycle_retry_exhausted", job=job_id, attempts=self._MAX_CYCLE_RETRIES)
+            return
+        self._retry_attempts[job_id] = attempt
+        run_date = datetime.now() + timedelta(minutes=self._RETRY_DELAY_MINUTES)
+        self.scheduler.add_job(
+            fn,
+            trigger="date",
+            run_date=run_date,
+            args=[account_key],
+            id=job_id,
+            replace_existing=True,
+            misfire_grace_time=1800,
+        )
+        logger.warning(
+            "cycle_retry_scheduled",
+            job=job_id, attempt=attempt,
+            run_date=run_date.isoformat(timespec="seconds"),
+        )
+
+    def _clear_retries(self, cycle_name: str, account_key: str) -> None:
+        self._retry_attempts.pop(f"retry_{cycle_name}_{account_key}", None)
+
     def _load_config(self) -> None:
         with open(self.config_path) as f:
             self.config = yaml.safe_load(f)
@@ -139,8 +184,6 @@ class Orchestrator:
             account_id = acct.get("ghostfolio_account_id", "")
             account_name = acct.get("name", key)
             risk_profile = acct.get("risk_profile", {})
-            take_profit_pct = risk_profile.get("take_profit_pct", 50.0)
-            auto_close_dte = risk_profile.get("auto_close_dte", 3)
 
             try:
                 tracker = OptionsPositionTracker()
@@ -181,70 +224,35 @@ class Orchestrator:
                 # Re-read positions after update (fresh P/L)
                 active = tracker.get_active_positions(key)
 
-                # Check for take-profit, auto-close, and near-ATM danger triggers
+                # Check exit triggers using the SAME rules as the weekly cycles:
+                # spreads → SpreadsRiskManager.check_position_exits,
+                # wheel   → OptionsRiskManager.auto_close_check (TP/DTE/near-ATM).
                 closes_needed = []
                 maintenance_reasons: dict[int, str] = {}
                 if self._is_spreads_account(acct):
-                    # Spreads use the same exit rules as the weekly cycle:
-                    # DTE / short-strike breach always, mark-based take-profit
-                    # and stop-loss only after min_holding_days.
                     risk_mgr = SpreadsRiskManager(risk_profile)
-                    for pos in active:
-                        try:
-                            spot = self.market_data.get_current_price(pos.symbol)
-                        except Exception:
-                            spot = None
-                        forced = risk_mgr.check_position_exits(pos, spot=spot)
-                        if forced is not None:
-                            closes_needed.append(pos)
-                            maintenance_reasons[pos.id] = forced.reason
-                            logger.info(
-                                "maintenance_spread_exit",
-                                account=account_name,
-                                symbol=pos.symbol,
-                                reason=forced.reason,
-                            )
-                    active_for_checks = []
+                    check_exit = risk_mgr.check_position_exits
+                    log_event = "maintenance_spread_exit"
                 else:
-                    active_for_checks = active
+                    risk_mgr = OptionsRiskManager(risk_profile)
+                    check_exit = risk_mgr.auto_close_check
+                    log_event = "maintenance_wheel_exit"
 
-                for pos in active_for_checks:
-                    captured = pos.profit_captured_pct
-                    if captured is not None and captured >= take_profit_pct:
+                for pos in active:
+                    try:
+                        spot = self.market_data.get_current_price(pos.symbol)
+                    except Exception:
+                        spot = None
+                    forced = check_exit(pos, spot=spot)
+                    if forced is not None:
                         closes_needed.append(pos)
+                        maintenance_reasons[pos.id] = forced.reason
                         logger.info(
-                            "maintenance_take_profit",
+                            log_event,
                             account=account_name,
                             symbol=pos.symbol,
-                            captured_pct=round(captured, 1),
+                            reason=forced.reason,
                         )
-                    elif pos.dte is not None and pos.dte <= auto_close_dte:
-                        closes_needed.append(pos)
-                        logger.info(
-                            "maintenance_dte_close",
-                            account=account_name,
-                            symbol=pos.symbol,
-                            dte=pos.dte,
-                        )
-                    elif pos.spread_type == "CASH_SECURED_PUT" and pos.dte is not None and pos.dte < 14:
-                        # Near-ATM danger: CSP within 2% of strike with < 14 DTE
-                        try:
-                            stock_price = self.market_data.get_current_price(pos.symbol)
-                            if stock_price and pos.sell_strike > 0:
-                                margin_pct = (stock_price - pos.sell_strike) / pos.sell_strike * 100
-                                if margin_pct < 2.0:
-                                    closes_needed.append(pos)
-                                    logger.warning(
-                                        "maintenance_near_atm_close",
-                                        account=account_name,
-                                        symbol=pos.symbol,
-                                        strike=pos.sell_strike,
-                                        stock_price=stock_price,
-                                        margin_pct=round(margin_pct, 2),
-                                        dte=pos.dte,
-                                    )
-                        except Exception:
-                            pass
 
                 if closes_needed:
                     from .options.decision_parser import WheelAction
@@ -253,12 +261,7 @@ class Orchestrator:
                             type="CLOSE",
                             symbol=pos.symbol,
                             position_id=pos.id,
-                            reason="Maintenance: " + maintenance_reasons.get(
-                                pos.id,
-                                ('take-profit ' + str(round(pos.profit_captured_pct or 0)) + '%'
-                                 if (pos.profit_captured_pct or 0) >= take_profit_pct
-                                 else 'DTE=' + str(pos.dte)),
-                            ),
+                            reason="Maintenance: " + maintenance_reasons[pos.id],
                         )
                         for pos in closes_needed
                     ]
@@ -653,7 +656,15 @@ class Orchestrator:
                     self.config.get("defaults", {}).get("initial_budget", 10000))
                 new_cash = compute_cash_from_orders(self.ghostfolio, account_id, initial_budget)
                 if new_cash is None:
+                    # Orders unavailable — estimate for the audit log only; never
+                    # write a delta-based guess back to Ghostfolio (it could
+                    # overwrite the real balance with garbage during an outage).
                     new_cash = max(0, portfolio.cash + cash_delta)
+                    cash_is_canonical = False
+                    logger.warning("account_balance_sync_skipped",
+                                   account=account_name, reason="orders_unavailable")
+                else:
+                    cash_is_canonical = True
 
                 portfolio_after = {
                     "total_value": portfolio.total_value,
@@ -665,7 +676,7 @@ class Orchestrator:
                 }
 
                 # Sync canonical cash balance back to Ghostfolio
-                if account_id:
+                if account_id and cash_is_canonical:
                     try:
                         self.ghostfolio.update_account(account_id, balance=new_cash)
                         logger.info("account_balance_updated", account=account_name, new_cash=round(new_cash, 2))
@@ -680,6 +691,8 @@ class Orchestrator:
             error_msg = str(e)
             logger.error("intraday_cycle_failed", account=account_name,
                          error=error_msg, exc_info=True)
+            if isinstance(e, ValuationUnavailable):
+                self._schedule_retry("intraday", self.run_intraday_cycle, account_key)
             analysis_raw = {}
             decision_raw = {}
             pass1_messages = []
@@ -716,6 +729,8 @@ class Orchestrator:
         )
 
         status = "ERROR" if error_msg else "OK"
+        if status == "OK":
+            self._clear_retries("intraday", account_key)
         logger.info("intraday_cycle_complete", account=account_name,
                     status=status, log=log_file)
 
@@ -1186,7 +1201,15 @@ class Orchestrator:
                 self.config.get("defaults", {}).get("initial_budget", 10000))
             new_cash = compute_cash_from_orders(self.ghostfolio, account_id, initial_budget)
             if new_cash is None:
+                # Orders unavailable — estimate for the audit log only; never
+                # write a delta-based guess back to Ghostfolio (it could
+                # overwrite the real balance with garbage during an outage).
                 new_cash = max(0, portfolio.cash + cash_delta)
+                cash_is_canonical = False
+                logger.warning("account_balance_sync_skipped",
+                               account=account_name, reason="orders_unavailable")
+            else:
+                cash_is_canonical = True
 
             portfolio_after = {
                 "total_value": portfolio.total_value,  # approx — prices unchanged short-term
@@ -1196,8 +1219,9 @@ class Orchestrator:
                 "cash_deployed": -cash_delta,
             }
 
-            # Sync canonical cash balance back to Ghostfolio
-            if account_id:
+            # Sync canonical cash balance back to Ghostfolio, only when trades
+            # actually executed and the cash was derived from the order history
+            if account_id and cash_is_canonical and any(t.get("success") for t in executed_trades):
                 try:
                     self.ghostfolio.update_account(account_id, balance=new_cash)
                     logger.info("account_balance_updated", account=account_name, new_cash=round(new_cash, 2))
@@ -1207,6 +1231,8 @@ class Orchestrator:
         except Exception as e:
             error_msg = str(e)
             logger.error("cycle_failed", account=account_name, error=error_msg, exc_info=True)
+            if isinstance(e, ValuationUnavailable):
+                self._schedule_retry("cycle", self.run_cycle, account_key)
             analysis_raw = {}
             decision_raw = {}
             bull_raw = {}
@@ -1250,6 +1276,8 @@ class Orchestrator:
         )
 
         status = "ERROR" if error_msg else "OK"
+        if status == "OK":
+            self._clear_retries("cycle", account_key)
         logger.info("cycle_complete", account=account_name, status=status, log=log_file)
 
 
@@ -1509,6 +1537,7 @@ class Orchestrator:
                 risk_profile=risk_profile,
                 dry_run=self.dry_run,
                 account_key=account_key,
+                cash_available=portfolio.cash,
             )
 
             all_closes = risk_result.forced_closes + risk_result.approved_closes
@@ -1536,8 +1565,14 @@ class Orchestrator:
                     "order_id": r.ghostfolio_order_id,
                 })
 
-            # Post-execution portfolio state
-            portfolio_after_state = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            # Post-execution portfolio state. Trades are already executed here —
+            # a valuation outage at this point must NOT fail the cycle (that would
+            # schedule a retry and double-execute); fall back to the pre-state.
+            try:
+                portfolio_after_state = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            except ValuationUnavailable:
+                logger.warning("post_execution_valuation_unavailable", account=account_name)
+                portfolio_after_state = portfolio
             new_active = tracker.get_active_positions(account_key)
             new_greeks = calculate_portfolio_greeks(
                 [{"current_greeks": p.current_greeks} for p in new_active if p.current_greeks]
@@ -1555,6 +1590,8 @@ class Orchestrator:
         except Exception as e:
             error_msg = str(e)
             logger.error("spreads_cycle_failed", account=account_name, error=error_msg, exc_info=True)
+            if isinstance(e, ValuationUnavailable):
+                self._schedule_retry("spreads", self.run_spreads_cycle, account_key)
 
         # ===== PHASE 6: AUDIT LOGGING =====
         _risk_result = risk_result or SpreadsRiskResult()
@@ -1583,6 +1620,8 @@ class Orchestrator:
         )
 
         status = "ERROR" if error_msg else "OK"
+        if status == "OK":
+            self._clear_retries("spreads", account_key)
         logger.info("spreads_cycle_complete", account=account_name, status=status, log=log_file)
 
 
@@ -1652,6 +1691,23 @@ class Orchestrator:
 
             # Market data + indicators
             quotes = self.market_data.get_quotes_batch(watchlist)
+
+            # Affordability filter: drop symbols whose CSP collateral (price×100)
+            # exceeds available cash — the model shouldn't waste picks on them.
+            # Assigned symbols always stay (needed for covered-call data).
+            unaffordable = [
+                sym for sym, q in quotes.items()
+                if sym not in assigned_symbols and q.price and q.price * 100 > portfolio.cash
+            ]
+            if unaffordable:
+                logger.info(
+                    "options_watchlist_unaffordable_dropped",
+                    account=account_name, symbols=unaffordable,
+                    cash=round(portfolio.cash, 2),
+                )
+                watchlist = [s for s in watchlist if s not in unaffordable]
+                quotes = {s: q for s, q in quotes.items() if s not in unaffordable}
+
             market_data = {}
             for sym, q in quotes.items():
                 market_data[sym] = {
@@ -1869,8 +1925,14 @@ class Orchestrator:
                     "order_id": r.ghostfolio_order_id,
                 })
 
-            # Post-execution portfolio state
-            portfolio_after_state = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            # Post-execution portfolio state. Trades are already executed here —
+            # a valuation outage at this point must NOT fail the cycle (that would
+            # schedule a retry and double-execute); fall back to the pre-state.
+            try:
+                portfolio_after_state = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            except ValuationUnavailable:
+                logger.warning("post_execution_valuation_unavailable", account=account_name)
+                portfolio_after_state = portfolio
             new_active = tracker.get_active_positions(account_key)
             new_greeks = calculate_portfolio_greeks(
                 [{"current_greeks": p.current_greeks} for p in new_active if p.current_greeks]
@@ -1888,6 +1950,8 @@ class Orchestrator:
         except Exception as e:
             error_msg = str(e)
             logger.error("options_cycle_failed", account=account_name, error=error_msg, exc_info=True)
+            if isinstance(e, ValuationUnavailable):
+                self._schedule_retry("options", self.run_options_cycle, account_key)
 
         # ===== PHASE 6: AUDIT LOGGING =====
         log_file = self.audit.log_cycle(
@@ -1915,6 +1979,8 @@ class Orchestrator:
         )
 
         status = "ERROR" if error_msg else "OK"
+        if status == "OK":
+            self._clear_retries("options", account_key)
         logger.info("options_cycle_complete", account=account_name, status=status, log=log_file)
 
 
@@ -1986,6 +2052,7 @@ def main():
 
     # Scheduled mode: set up cron jobs for each account
     scheduler = BlockingScheduler()
+    orch.scheduler = scheduler  # enables one-shot cycle retries on valuation outage
 
     for key, acct in orch.config.get("accounts", {}).items():
         if acct.get("enabled") is False:
@@ -2030,15 +2097,17 @@ def main():
         except Exception as e:
             logger.error("scheduler_setup_failed", account=key, error=str(e))
 
-    # Daily options maintenance (Mon-Fri 17:00 — update P/L, check take-profit/expiry)
+    # Daily options maintenance (every day 17:00 — update P/L, check take-profit/expiry).
+    # Weekend runs settle Friday dte==0 expiries/assignments off the last close;
+    # Sunday is a harmless no-op.
     scheduler.add_job(
         orch.run_options_maintenance,
-        trigger=CronTrigger(day_of_week="mon-fri", hour=17, minute=0, timezone="Europe/Warsaw"),
+        trigger=CronTrigger(hour=17, minute=0, timezone="Europe/Warsaw"),
         id="options_maintenance",
         name="Daily options maintenance (P/L + take-profit + expiry)",
         misfire_grace_time=1800,
     )
-    logger.info("scheduler_options_maintenance_added", cron="0 17 * * 1-5")
+    logger.info("scheduler_options_maintenance_added", cron="0 17 * * *")
 
     # Weekly self-critique reflection (Sunday 19:00 — before weekly trading cycles)
     scheduler.add_job(

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock
 import yaml
 
 from orchestrator.src import main as main_module
-from orchestrator.src.portfolio_state import PortfolioState
+from orchestrator.src.portfolio_state import PortfolioState, ValuationUnavailable
 
 
 def _write_config(tmp_path, config: dict):
@@ -41,6 +41,8 @@ def _make_orchestrator(config_path, dry_run=False):
     orch.account_mgr = MagicMock()
     orch.reflection = MagicMock()
     orch.rag = MagicMock()
+    orch.scheduler = None
+    orch._retry_attempts = {}
     orch._load_config()
     return orch
 
@@ -117,6 +119,93 @@ def test_run_cycle_rules_mode_initializes_audit_fields(tmp_path, monkeypatch):
     assert captured["pass1_messages"] == []
     assert captured["pass2_messages"] == []
     assert captured["error"] is None
+
+
+def _rules_account_config() -> dict:
+    return {
+        "defaults": {"initial_budget": 10000},
+        "accounts": {
+            "rules_account": {
+                "name": "Rules Account",
+                "strategy": "nonexistent",
+                "decision_mode": "rules",
+                "watchlist": ["SPY"],
+                "ghostfolio_account_id": "acct-1",
+                "model": "Nemotron",
+                "risk_profile": {},
+                "rules_params": {},
+            }
+        },
+    }
+
+
+def test_valuation_unavailable_aborts_cycle_and_schedules_retry(tmp_path, monkeypatch):
+    """ValuationUnavailable → cycle audited as ERROR, retry scheduled, no balance write."""
+    config_path = _write_config(tmp_path, _rules_account_config())
+    orch = _make_orchestrator(config_path)
+    orch.scheduler = MagicMock()
+
+    captured = {}
+    orch.audit.log_cycle.side_effect = lambda **kwargs: captured.update(kwargs) or "audit.json"
+
+    def raise_unavailable(*args, **kwargs):
+        raise ValuationUnavailable("Ghostfolio down")
+
+    monkeypatch.setattr(main_module, "WatchlistManager", StubWatchlistManager)
+    monkeypatch.setattr(main_module, "get_portfolio_state", raise_unavailable)
+    monkeypatch.setattr(main_module.ResearchAgent, "load_today", lambda: None)
+
+    orch.run_cycle("rules_account")
+
+    assert captured["error"] is not None
+    orch.ghostfolio.update_account.assert_not_called()
+    assert orch.scheduler.add_job.called
+    job_kwargs = orch.scheduler.add_job.call_args.kwargs
+    assert job_kwargs["id"] == "retry_cycle_rules_account"
+    assert job_kwargs["replace_existing"] is True
+
+
+def test_retry_attempts_capped(tmp_path):
+    config_path = _write_config(tmp_path, _rules_account_config())
+    orch = _make_orchestrator(config_path)
+    orch.scheduler = MagicMock()
+
+    for _ in range(5):
+        orch._schedule_retry("cycle", lambda key: None, "rules_account")
+
+    assert orch.scheduler.add_job.call_count == main_module.Orchestrator._MAX_CYCLE_RETRIES
+
+
+def test_cash_write_back_skipped_when_orders_unavailable(tmp_path, monkeypatch):
+    """compute_cash_from_orders → None must never write a guessed balance to Ghostfolio."""
+    config_path = _write_config(tmp_path, _rules_account_config())
+    orch = _make_orchestrator(config_path)
+
+    quote = SimpleNamespace(
+        price=500.0, change_pct=0.0, pe_ratio=None, dividend_yield=None,
+        week52_high=None, week52_low=None, sector="ETF", short_pct_float=None,
+    )
+    orch.market_data.get_quotes_batch.return_value = {"SPY": quote}
+    orch.market_data.get_history.return_value = SimpleNamespace(empty=True)
+    orch.market_data.get_market_overview.return_value = {}
+    orch.market_data.format_upcoming_earnings.return_value = ""
+    orch.market_data.get_upcoming_earnings.return_value = {}
+    orch.news.fetch_relevant_news.return_value = []
+    orch.news.format_for_prompt.return_value = ""
+    orch.audit.get_decision_history.return_value = []
+    orch.audit.log_cycle.return_value = "audit.json"
+
+    monkeypatch.setattr(main_module, "WatchlistManager", StubWatchlistManager)
+    monkeypatch.setattr(main_module, "get_portfolio_state", lambda *args, **kwargs: _make_portfolio())
+    monkeypatch.setattr(main_module, "get_fundamentals_batch", lambda **kwargs: {})
+    monkeypatch.setattr(main_module, "format_fundamentals_for_prompt", lambda *args, **kwargs: "")
+    monkeypatch.setattr(main_module, "format_decision_history", lambda history: "")
+    monkeypatch.setattr(main_module, "compute_cash_from_orders", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main_module.ResearchAgent, "load_today", lambda: None)
+
+    orch.run_cycle("rules_account")
+
+    orch.ghostfolio.update_account.assert_not_called()
 
 
 def test_options_maintenance_passes_market_data_and_account_id(tmp_path, monkeypatch):

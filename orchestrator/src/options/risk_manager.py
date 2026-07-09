@@ -110,11 +110,13 @@ class OptionsRiskManager:
             if a.type == "CLOSE" and a.position_id is not None
         }
 
+        md_for_close = market_data or {}
         for pos in active_positions:
             if pos.id in llm_close_ids:
                 continue   # LLM already handling it
 
-            forced = self._auto_close_check(pos)
+            spot = (md_for_close.get(pos.symbol) or {}).get("price")
+            forced = self.auto_close_check(pos, spot=spot)
             if forced is not None:
                 result.forced_closes.append(forced)
                 result.modifications.append(
@@ -177,6 +179,17 @@ class OptionsRiskManager:
             #    A CSP requires strike × 100 in cash as collateral.
             #    We don't know the exact strike yet (executor picks it), so use
             #    current price × 100 as a conservative upper bound.
+            # No strike hint and no market data → symbol is off-watchlist; say so
+            # explicitly instead of reporting a confusing 2×account-value estimate.
+            if not (action.strike and action.strike > 0) and not (md.get(symbol) or {}).get("price"):
+                reason = (
+                    f"No market data for {symbol} — symbol not on watchlist, "
+                    f"cannot size CSP collateral"
+                )
+                result.rejected_opens.append({"instruction": action, "reason": reason})
+                result.modifications.append(f"[REJECTED CSP] {symbol}: {reason}")
+                continue
+
             estimated_assignment = _estimate_assignment_cost(
                 action, portfolio, account_value, md.get(symbol, {})
             )
@@ -272,8 +285,17 @@ class OptionsRiskManager:
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _auto_close_check(self, pos: OptionsPosition) -> WheelAction | None:
-        """Return a forced-close WheelAction if the position meets an auto-close rule."""
+    def auto_close_check(
+        self,
+        pos: OptionsPosition,
+        spot: float | None = None,
+    ) -> WheelAction | None:
+        """Return a forced-close WheelAction if the position meets an auto-close rule.
+
+        Shared by the weekly cycle and daily maintenance so both apply
+        identical exit rules. ``spot`` (current underlying price) enables the
+        near-ATM CSP guard; pass None to skip it.
+        """
 
         # DTE expiry threshold (avoid assignment/exercise risk at last moment)
         if pos.dte is not None and pos.dte <= self.auto_close_dte:
@@ -294,7 +316,29 @@ class OptionsRiskManager:
                 reason=f"Take-profit: {captured:.0f}% of max premium captured (≥{self.take_profit_pct}%)",
             )
 
+        # Near-ATM danger: short-dated CSP within 2% of its strike
+        if (
+            spot is not None
+            and pos.spread_type == "CASH_SECURED_PUT"
+            and pos.dte is not None and pos.dte < 14
+            and pos.sell_strike and pos.sell_strike > 0
+        ):
+            margin_pct = (spot - pos.sell_strike) / pos.sell_strike * 100
+            if margin_pct < 2.0:
+                return WheelAction(
+                    type="CLOSE",
+                    symbol=pos.symbol,
+                    position_id=pos.id,
+                    reason=(
+                        f"Near-ATM: spot ${spot:.2f} within {margin_pct:.1f}% of "
+                        f"strike ${pos.sell_strike:.2f} with DTE={pos.dte}"
+                    ),
+                )
+
         return None
+
+    # Backwards-compatible alias
+    _auto_close_check = auto_close_check
 
 
 # ---------------------------------------------------------------------------

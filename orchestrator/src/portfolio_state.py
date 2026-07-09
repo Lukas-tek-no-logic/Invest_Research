@@ -12,6 +12,14 @@ from .ghostfolio_client import GhostfolioClient
 logger = structlog.get_logger()
 
 
+class ValuationUnavailable(RuntimeError):
+    """Ghostfolio valuation could not be fetched or built — do not trade.
+
+    Raised instead of returning a zero-value PortfolioState so cycles abort
+    (and may retry) rather than acting on a fabricated $0 portfolio.
+    """
+
+
 @dataclass
 class Position:
     symbol: str
@@ -115,22 +123,15 @@ def get_portfolio_state(
       - order list    → per-account positions (filtered by accountId)
       - holdings list → current market prices (matched by symbol)
     """
-    _empty = PortfolioState(
-        account_id=account_id,
-        account_name=account_name,
-        total_value=0,
-        cash=0,
-        invested=0,
-        timestamp=datetime.utcnow().isoformat(),
-    )
-
     try:
         accounts_raw = client.list_accounts()
         orders_raw = client.list_orders()
         holdings_raw = client.get_portfolio_holdings()
     except Exception as e:
         logger.error("portfolio_state_fetch_failed", account_id=account_id, error=str(e))
-        return _empty
+        raise ValuationUnavailable(
+            f"Ghostfolio fetch failed for account {account_name} ({account_id}): {e}"
+        ) from e
 
     try:
         # ── 1. Account cash + total value ──────────────────────────────────────
@@ -145,13 +146,17 @@ def get_portfolio_state(
             (a for a in accounts if isinstance(a, dict) and a.get("id") == account_id),
             None,
         )
+        if account_info is None:
+            raise ValuationUnavailable(
+                f"Account {account_name} ({account_id}) not found in Ghostfolio account list"
+            )
 
-        cash = float(account_info.get("balance", 0) or 0) if account_info else 0.0
+        cash = float(account_info.get("balance", 0) or 0)
         # valueInBaseCurrency = securities market value only (NOT cash).
         # Exception: for accounts with no real positions Ghostfolio echoes the cash
         # balance here, which would double-count if we then added cash again.
         # Detect this by checking if api_total ≈ cash (within 0.5%).
-        api_total_raw = float(account_info.get("valueInBaseCurrency", 0) or 0) if account_info else 0.0
+        api_total_raw = float(account_info.get("valueInBaseCurrency", 0) or 0)
         if cash > 0 and abs(api_total_raw - cash) / cash < 0.005:
             api_total = 0.0  # no real securities; total_value = cash only
         else:
@@ -310,9 +315,13 @@ def get_portfolio_state(
         )
         return state
 
+    except ValuationUnavailable:
+        raise
     except Exception as e:
         logger.error("portfolio_state_build_failed", account_id=account_id, error=str(e))
-        return _empty
+        raise ValuationUnavailable(
+            f"Portfolio state build failed for account {account_name} ({account_id}): {e}"
+        ) from e
 
 
 def compute_cash_from_orders(

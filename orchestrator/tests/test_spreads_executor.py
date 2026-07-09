@@ -9,7 +9,7 @@ from orchestrator.src.options.spreads_selector import SelectedSpread, SelectedLe
 from orchestrator.src.options.positions import OptionsPosition
 
 
-def _make_executor(dry_run=False):
+def _make_executor(dry_run=False, **extra_kwargs):
     mock_ghostfolio = MagicMock()
     mock_ghostfolio.create_order.return_value = {"id": "gf-order-123"}
     mock_market_data = MagicMock()
@@ -30,6 +30,7 @@ def _make_executor(dry_run=False):
         },
         dry_run=dry_run,
         account_key="test_key",
+        **extra_kwargs,
     )
     return executor, mock_ghostfolio, mock_tracker
 
@@ -117,6 +118,43 @@ class TestSpreadsExecutorOpens:
         assert "selection failed" in results[0].error
         mock_tracker.open_position.assert_not_called()
         mock_gf.create_order.assert_not_called()
+
+    @patch("orchestrator.src.options.spreads_executor.select_spread")
+    def test_open_rejected_when_real_max_loss_exceeds_cash(self, mock_select):
+        """Selector's real max_loss ($300) over the cash budget → open rejected."""
+        mock_select.return_value = _make_selected_spread()
+        executor, mock_gf, mock_tracker = _make_executor(cash_available=250.0)
+
+        action = SpreadAction(
+            type="OPEN_SPREAD", symbol="SPY",
+            spread_type="iron_condor", contracts=1,
+        )
+        results = executor.execute_opens([action])
+
+        assert len(results) == 1
+        assert results[0].success is False
+        assert "max loss" in results[0].error.lower()
+        mock_tracker.open_position.assert_not_called()
+        mock_gf.create_order.assert_not_called()
+
+    @patch("orchestrator.src.options.spreads_executor.select_spread")
+    def test_open_budget_decrements_across_opens(self, mock_select):
+        """Two opens with budget for one: first passes, second rejected."""
+        mock_select.return_value = _make_selected_spread()
+        executor, _, mock_tracker = _make_executor(cash_available=400.0)
+
+        actions = [
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY",
+                         spread_type="iron_condor", contracts=1),
+            SpreadAction(type="OPEN_SPREAD", symbol="QQQ",
+                         spread_type="iron_condor", contracts=1),
+        ]
+        results = executor.execute_opens(actions)
+
+        # max_loss=300 each: 400 → first OK (100 left), second rejected
+        assert results[0].success is True
+        assert results[1].success is False
+        assert mock_tracker.open_position.call_count == 1
 
     @patch("orchestrator.src.options.spreads_executor.select_spread")
     def test_open_dry_run(self, mock_select):
@@ -217,8 +255,10 @@ class TestSpreadsExecutorUpdates:
 
     @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
     def test_update_no_price(self, mock_price):
+        """No leg quote AND no spot price → update fails (no data at all)."""
         mock_price.return_value = None
         executor, _, mock_tracker = _make_executor()
+        executor.market_data.get_current_price.return_value = None
 
         pos = _make_position(id=1, dte=20)
         results = executor.update_active_positions([pos])
@@ -226,6 +266,23 @@ class TestSpreadsExecutorUpdates:
         assert len(results) == 1
         assert results[0].success is False
         assert "Could not fetch" in results[0].error
+
+    @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
+    def test_update_no_price_falls_back_to_intrinsic(self, mock_price):
+        """Missing leg quote with spot available → intrinsic value, update succeeds."""
+        mock_price.return_value = None
+        executor, _, mock_tracker = _make_executor()
+        # Spot $532: buy put 530 intrinsic = 0, sell put 535 intrinsic = 3.0
+        executor.market_data.get_current_price.return_value = 532.0
+
+        pos = _make_position(id=1, dte=20)
+        results = executor.update_active_positions([pos])
+
+        assert len(results) == 1
+        assert results[0].success is True
+        call_args = mock_tracker.update_position.call_args
+        # current_value = buy - sell = 0 - 3.0 = -3.0
+        assert call_args[1]["current_value"] == -3.0
 
 
 class TestSpreadsExecutorRolls:

@@ -26,7 +26,7 @@ accounts:
     fallback_model: "Nemotron"
     broker_cost_model: "ibkr"
     cron: "0 20 * * 6"   # Sunday 20:00
-    decision_mode: "rules"
+    decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "core_satellite"
     strategy_description: "Core-Satellite: 60% ETF core + 30% stock satellites + 10% cash reserve"
     prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha."
@@ -52,7 +52,7 @@ accounts:
     fallback_model: "Nemotron"
     broker_cost_model: "ibkr"
     cron: "20 20 1 * *"  # 1st of month 20:20 (staggered +20min vs Weekly)
-    decision_mode: "rules"
+    decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "value_investing"
     strategy_description: "Value Investing: 40% ETF + 50% undervalued stocks + 10% cash reserve"
     prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding."
@@ -77,7 +77,7 @@ accounts:
     fallback_model: "Miro_Thinker"
     broker_cost_model: "ibkr"
     cron: "0 18 * * 0-4"  # Mon-Fri 18:00
-    decision_mode: "rules"
+    decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "momentum"
     strategy_description: "Momentum/Swing: 20% ETF + 70% high-momentum stocks + 10% cash reserve"
     prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength."
@@ -96,11 +96,11 @@ accounts:
       min_momentum_score: 45
       sell_score_threshold: 30
       max_positions: 3
-    watchlist:
+    watchlist:              # no 3x leveraged ETFs — they whipsawed the -12% stop
       - SPY
       - QQQ
-      - TQQQ
-      - SOXL
+      - SMH
+      - IWM
 
   options_spreads:
     name: "Wheel Strategy (Qwen)"
@@ -111,7 +111,7 @@ accounts:
     cron: "20 18 * * 4"  # Friday 18:20 (staggered +20min vs Daily)
     strategy: "wheel"
     strategy_description: "Wheel Strategy: sell cash-secured puts on quality underlyings; if assigned sell covered calls above cost basis"
-    prompt_style: "Analyze IV regime and select the best underlyings for premium selling. Use available cash — CSP collateral IS the cash. Prefer stocks under $100 so 1 contract fits the account size."
+    prompt_style: "Analyze IV regime and select the best underlyings for premium selling from the fixed watchlist (all affordable: 1 CSP contract fits the account). Use available cash — CSP collateral IS the cash."
     preferred_metrics: ["IV", "Delta", "Theta", "RSI", "Trend"]
     horizon: "weeks (DTE 30-45)"
     risk_profile:
@@ -127,9 +127,17 @@ accounts:
       take_profit_pct: 50
       stop_loss_pct: 200     # 200% of premium = stop loss for shorts
       earnings_blackout_days: 5
-      min_premium_yield_pct: 5.0  # min monthly yield = premium / (strike*100) * (30/dte) * 100
-    watchlist:
-      - SPY
+      min_premium_yield_pct: 1.5  # min monthly yield = premium / (strike*100) * (30/dte) * 100 (~18%/yr)
+    watchlist:               # liquid sub-$80 underlyings: strike*100 fits a $10K account
+      - F
+      - T
+      - PFE
+      - SOFI
+      - BAC
+      - VZ
+      - GM
+      - UBER
+      - PYPL
 
   weekly_balanced_nemotron:
     name: "Weekly Balanced (Nemotron)"
@@ -138,7 +146,7 @@ accounts:
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
     cron: "20 20 * * 6"  # Sunday 20:20 (staggered +20min vs Qwen)
-    decision_mode: "rules"
+    decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "core_satellite"
     strategy_description: "Core-Satellite: 60% ETF core + 30% stock satellites + 10% cash reserve"
     prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha."
@@ -164,7 +172,7 @@ accounts:
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
     cron: "40 20 1 * *"  # 1st of month 20:40 (staggered +20min vs Qwen)
-    decision_mode: "rules"
+    decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "value_investing"
     strategy_description: "Value Investing: 40% ETF + 50% undervalued stocks + 10% cash reserve"
     prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding."
@@ -189,7 +197,7 @@ accounts:
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
     cron: "20 18 * * 0-4"  # Mon-Fri 18:20 (staggered +20min vs Qwen)
-    decision_mode: "rules"
+    decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "momentum"
     strategy_description: "Momentum/Swing: 20% ETF + 70% high-momentum stocks + 10% cash reserve"
     prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength."
@@ -208,11 +216,11 @@ accounts:
       min_momentum_score: 45
       sell_score_threshold: 30
       max_positions: 3
-    watchlist:
+    watchlist:              # no 3x leveraged ETFs — they whipsawed the -12% stop
       - SPY
       - QQQ
-      - TQQQ
-      - SOXL
+      - SMH
+      - IWM
 
   options_spreads_nemotron:
     name: "Wheel Strategy (Nemotron)"
@@ -223,7 +231,7 @@ accounts:
     cron: "40 18 * * 4"  # Friday 18:40 (staggered +20min vs Qwen)
     strategy: "wheel"
     strategy_description: "Wheel Strategy: sell cash-secured puts on quality underlyings; if assigned sell covered calls above cost basis"
-    prompt_style: "Analyze IV regime and select the best underlyings for premium selling. Use available cash — CSP collateral IS the cash. Prefer stocks under $100 so 1 contract fits the account size."
+    prompt_style: "Analyze IV regime and select the best underlyings for premium selling from the fixed watchlist (all affordable: 1 CSP contract fits the account). Use available cash — CSP collateral IS the cash."
     preferred_metrics: ["IV", "Delta", "Theta", "RSI", "Trend"]
     horizon: "weeks (DTE 30-45)"
     risk_profile:
@@ -239,9 +247,17 @@ accounts:
       take_profit_pct: 50
       stop_loss_pct: 200
       earnings_blackout_days: 5
-      min_premium_yield_pct: 5.0  # min monthly yield = premium / (strike*100) * (30/dte) * 100
-    watchlist:
-      - SPY
+      min_premium_yield_pct: 1.5  # min monthly yield = premium / (strike*100) * (30/dte) * 100 (~18%/yr)
+    watchlist:               # liquid sub-$80 underlyings: strike*100 fits a $10K account
+      - F
+      - T
+      - PFE
+      - SOFI
+      - BAC
+      - VZ
+      - GM
+      - UBER
+      - PYPL
 
   spreads_qwen:
     name: "Vertical Spreads (Qwen)"

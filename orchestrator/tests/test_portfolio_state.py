@@ -6,7 +6,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from src.portfolio_state import PortfolioState, get_portfolio_state, compute_cash_from_orders
+from src.portfolio_state import (
+    PortfolioState,
+    ValuationUnavailable,
+    get_portfolio_state,
+    compute_cash_from_orders,
+)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -226,10 +231,15 @@ class TestGetPortfolioState:
         assert state.total_pl == pytest.approx(500.0, abs=0.01)  # $2500 - $2000
         assert state.total_pl_pct == pytest.approx(25.0, abs=0.1)  # 25%
 
-    def test_ghostfolio_unavailable_returns_empty(self):
-        """If Ghostfolio raises, return empty state (not crash)."""
+    def test_ghostfolio_unavailable_raises(self):
+        """If Ghostfolio raises, propagate ValuationUnavailable — never a $0 state."""
         gf = MagicMock()
         gf.list_accounts.side_effect = Exception("connection refused")
-        state = get_portfolio_state(gf, ACCOUNT_ID, ACCOUNT_NAME)
-        assert state.total_value == 0
-        assert state.positions == []
+        with pytest.raises(ValuationUnavailable):
+            get_portfolio_state(gf, ACCOUNT_ID, ACCOUNT_NAME)
+
+    def test_account_missing_raises(self):
+        """Account id absent from Ghostfolio account list → ValuationUnavailable."""
+        gf = _make_ghostfolio(balance=10_000, value_in_base=10_000)
+        with pytest.raises(ValuationUnavailable):
+            get_portfolio_state(gf, "no-such-account", ACCOUNT_NAME)

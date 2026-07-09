@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import re
 import time
+from calendar import timegm
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 import feedparser
 import structlog
@@ -12,22 +14,22 @@ import structlog
 logger = structlog.get_logger()
 
 NEWS_CACHE_TTL = 900  # 15 minutes
+MAX_NEWS_AGE_DAYS = 3  # drop items older than this; undated items rank last
 
 RSS_FEEDS = {
     # Financial
     "yahoo_finance": "https://finance.yahoo.com/news/rssindex",
     "cnbc_top": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
     "cnbc_market": "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=20910258",
-    "reuters_business": "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
-    "marketwatch": "http://feeds.marketwatch.com/marketwatch/topstories/",
     "wsj_markets": "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     "investing_com": "https://www.investing.com/rss/news.rss",
     # Geopolitical
-    "reuters_world": "https://feeds.reuters.com/reuters/worldNews",
     "bbc_business": "https://feeds.bbci.co.uk/news/business/rss.xml",
     "bbc_world": "https://feeds.bbci.co.uk/news/world/rss.xml",
-    "ap_top": "https://feeds.apnews.com/rss/apf-topnews",
     "aljazeera": "https://www.aljazeera.com/xml/rss/all.xml",
+    # Removed defunct feeds that served stale/empty content:
+    # reuters_business, reuters_world (reutersagency.com retired),
+    # ap_top (apnews rss removed), marketwatch (redirects to paywall)
 }
 
 
@@ -39,6 +41,13 @@ class NewsItem:
     published: str
     link: str
     relevance_score: float = 0.0
+    published_dt: datetime | None = None
+
+    @property
+    def age_hours(self) -> float | None:
+        if self.published_dt is None:
+            return None
+        return max(0.0, (datetime.now(timezone.utc) - self.published_dt).total_seconds() / 3600)
 
 
 class NewsFetcher:
@@ -65,17 +74,36 @@ class NewsFetcher:
             except Exception as e:
                 logger.warning("news_feed_failed", source=source_name, error=str(e))
 
+        # Drop stale items — a months-old story presented as current misleads
+        # the model. Undated items are kept but ranked last (see sort key).
+        max_age_h = MAX_NEWS_AGE_DAYS * 24
+        fresh_items = [
+            it for it in all_items
+            if it.age_hours is None or it.age_hours <= max_age_h
+        ]
+        if len(fresh_items) < len(all_items):
+            logger.info(
+                "news_stale_dropped",
+                dropped=len(all_items) - len(fresh_items),
+                max_age_days=MAX_NEWS_AGE_DAYS,
+            )
+
         # Deduplicate by title similarity
         seen_titles: set[str] = set()
         unique_items = []
-        for item in all_items:
+        for item in fresh_items:
             normalized = item.title.lower().strip()
             if normalized not in seen_titles:
                 seen_titles.add(normalized)
                 unique_items.append(item)
 
-        # Sort by relevance (financial keywords)
-        unique_items.sort(key=lambda x: x.relevance_score, reverse=True)
+        # Sort by relevance × recency decay (score halves every 24h of age;
+        # undated items get the full-age penalty so dated news wins ties)
+        def _rank(item: NewsItem) -> float:
+            age_h = item.age_hours if item.age_hours is not None else max_age_h
+            return item.relevance_score * (0.5 ** (age_h / 24))
+
+        unique_items.sort(key=_rank, reverse=True)
 
         self._cache[cache_key] = (unique_items, time.time())
         logger.info("news_fetched", total_items=len(unique_items))
@@ -203,6 +231,13 @@ class NewsFetcher:
                 summary = summary[:300] + "..."
 
             published = entry.get("published", entry.get("updated", ""))
+            parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+            published_dt = None
+            if parsed:
+                try:
+                    published_dt = datetime.fromtimestamp(timegm(parsed), tz=timezone.utc)
+                except (ValueError, OverflowError, TypeError):
+                    pass
 
             item = NewsItem(
                 title=title,
@@ -211,6 +246,7 @@ class NewsFetcher:
                 published=published,
                 link=entry.get("link", ""),
                 relevance_score=self._base_relevance(title, summary),
+                published_dt=published_dt,
             )
             items.append(item)
         return items
@@ -242,7 +278,11 @@ class NewsFetcher:
 
         lines = ["== RECENT NEWS =="]
         for i, item in enumerate(news, 1):
-            lines.append(f"{i}. [{item.source}] {item.title}")
+            date_str = (
+                item.published_dt.strftime("%Y-%m-%d") if item.published_dt
+                else "undated"
+            )
+            lines.append(f"{i}. [{item.source}, {date_str}] {item.title}")
             if item.summary:
                 lines.append(f"   {item.summary[:200]}")
         return "\n".join(lines)
