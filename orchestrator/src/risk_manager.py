@@ -18,6 +18,10 @@ MIN_PRICE = 5.0
 MIN_AVG_DAILY_VOLUME_USD = 100_000
 MAX_PORTFOLIO_DRAWDOWN_PCT = -20.0
 
+# Cash-equivalent ETFs (T-bills): exempt from max_position_pct so idle cash
+# can be parked in full — a 40%-cash account should be able to park 40%.
+CASH_EQUIVALENT_SYMBOLS = {"BIL", "SGOV"}
+
 # Pairs of highly correlated assets (buying both in same cycle is redundant)
 CORRELATED_PAIRS = [
     {"VTI", "VOO"},
@@ -279,12 +283,13 @@ class RiskManager:
             check.modification_reason = f"Trimmed to respect {self.min_cash_pct}% cash reserve"
 
         # Rule: Position size <= max_position_pct
+        # (cash-equivalents are exempt — parking idle cash is not concentration risk)
         existing_position = portfolio.get_position(action.symbol)
         existing_value = existing_position.market_value if existing_position else 0
         new_total = existing_value + check.action.amount_usd
         max_position_value = portfolio.total_value * self.max_position_pct / 100
 
-        if new_total > max_position_value:
+        if new_total > max_position_value and action.symbol not in CASH_EQUIVALENT_SYMBOLS:
             allowed = max(0, max_position_value - existing_value)
             if allowed <= 0:
                 check.approved = False

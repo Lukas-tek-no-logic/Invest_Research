@@ -469,8 +469,12 @@ class OptionsExecutor:
                             strike=pos.sell_strike, stock_price=stock_price,
                         )
                         cost_basis = self.tracker.assign_position(pos.id, stock_price)
-                        # Record stock purchase in Ghostfolio
-                        self._ghostfolio_assignment(pos, cost_basis)
+                        if not self.dry_run:
+                            # Record stock purchase AND settle the synthetic option
+                            # symbol at $0 — otherwise the GF_WHEEL SELL stays open
+                            # forever as a phantom short holding in Ghostfolio.
+                            self._ghostfolio_assignment(pos, cost_basis)
+                            self._ghostfolio_close(pos, 0.0)
                         return OptionsTradeResult(
                             action="ASSIGNMENT", symbol=pos.symbol,
                             spread_type=pos.spread_type,
@@ -489,8 +493,10 @@ class OptionsExecutor:
                         realized_pl = self.tracker.call_away_position(
                             pos.id, pos.sell_strike, cc_premium,
                         )
-                        # Record stock sale in Ghostfolio
-                        self._ghostfolio_call_away(pos)
+                        if not self.dry_run:
+                            # Record stock sale AND settle the synthetic option symbol
+                            self._ghostfolio_call_away(pos)
+                            self._ghostfolio_close(pos, 0.0)
                         return OptionsTradeResult(
                             action="CALLED_AWAY", symbol=pos.symbol,
                             spread_type=pos.spread_type,
@@ -498,8 +504,11 @@ class OptionsExecutor:
                             realized_pl=realized_pl,
                         )
 
-                # OTM expiry — worthless
+                # OTM expiry — worthless. Settle the synthetic option symbol at $0
+                # in Ghostfolio or it stays open forever as a phantom holding.
                 logger.info("wheel_position_expired", pos_id=pos.id, symbol=pos.symbol)
+                if not self.dry_run:
+                    self._ghostfolio_close(pos, 0.0)
                 self.tracker.expire_position(pos.id)
                 return OptionsTradeResult(
                     action="UPDATE", symbol=pos.symbol,

@@ -1,5 +1,6 @@
 defaults:
   initial_budget: 10000
+  pass2_samples: 3           # self-consistency: sample Pass 2 N times, execute only actions in >=2/3
   currency: USD
   data_source: YAHOO
   llm_base_url: http://192.168.0.169:8080/v1
@@ -29,7 +30,7 @@ accounts:
     decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "core_satellite"
     strategy_description: "Core-Satellite: 60% ETF core + 30% stock satellites + 10% cash reserve"
-    prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha."
+    prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha. Idle cash beyond the reserve earns nothing — park it in BIL (T-bill ETF, ~4-5% yield) until you have a better use."
     preferred_metrics: ["SMA", "RSI", "PE"]
     horizon: "weeks to months"
     risk_profile:
@@ -44,6 +45,7 @@ accounts:
       - QQQ
       - VTI
       - VOO
+      - BIL              # T-bill ETF — parking for idle cash
 
   monthly_value:
     name: "Monthly Value"
@@ -55,7 +57,7 @@ accounts:
     decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "value_investing"
     strategy_description: "Value Investing: 40% ETF + 50% undervalued stocks + 10% cash reserve"
-    prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding."
+    prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding. Idle cash beyond the reserve earns nothing — park it in BIL (T-bill ETF, ~4-5% yield) until you have a better use."
     preferred_metrics: ["PE", "PB", "DividendYield", "FCF"]
     horizon: "months to years"
     risk_profile:
@@ -69,6 +71,7 @@ accounts:
       - VTI
       - SCHD
       - VYM
+      - BIL              # T-bill ETF — parking for idle cash
 
   daily_momentum:
     name: "Daily Momentum"
@@ -80,7 +83,7 @@ accounts:
     decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "momentum"
     strategy_description: "Momentum/Swing: 20% ETF + 70% high-momentum stocks + 10% cash reserve"
-    prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength."
+    prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength. Idle cash beyond the reserve earns nothing — park it in BIL (T-bill ETF, ~4-5% yield) until you have a better use."
     preferred_metrics: ["RSI", "MACD", "Volume", "BollingerBands"]
     horizon: "days to weeks"
     risk_profile:
@@ -101,6 +104,7 @@ accounts:
       - QQQ
       - SMH
       - IWM
+      - BIL              # T-bill ETF — parking for idle cash
 
   options_spreads:
     name: "Wheel Strategy (Qwen)"
@@ -108,7 +112,7 @@ accounts:
     model: "QWEN3.5"
     fallback_model: "Nemotron"
     broker_cost_model: "ibkr"
-    cron: "20 18 * * 4"  # Friday 18:20 (staggered +20min vs Daily)
+    cron: "20 18 * * 0,4"  # Mon+Fri 18:20 — 2x/week so freed collateral redeploys faster
     strategy: "wheel"
     strategy_description: "Wheel Strategy: sell cash-secured puts on quality underlyings; if assigned sell covered calls above cost basis"
     prompt_style: "Analyze IV regime and select the best underlyings for premium selling from the fixed watchlist (all affordable: 1 CSP contract fits the account). Use available cash — CSP collateral IS the cash."
@@ -149,7 +153,7 @@ accounts:
     decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "core_satellite"
     strategy_description: "Core-Satellite: 60% ETF core + 30% stock satellites + 10% cash reserve"
-    prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha."
+    prompt_style: "Balance risk and return. Prefer broad ETF exposure as core, select individual stocks as satellites for alpha. Idle cash beyond the reserve earns nothing — park it in BIL (T-bill ETF, ~4-5% yield) until you have a better use."
     preferred_metrics: ["SMA", "RSI", "PE"]
     horizon: "weeks to months"
     risk_profile:
@@ -164,6 +168,7 @@ accounts:
       - QQQ
       - VTI
       - VOO
+      - BIL              # T-bill ETF — parking for idle cash
 
   monthly_value_nemotron:
     name: "Monthly Value (Nemotron)"
@@ -175,7 +180,7 @@ accounts:
     decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "value_investing"
     strategy_description: "Value Investing: 40% ETF + 50% undervalued stocks + 10% cash reserve"
-    prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding."
+    prompt_style: "Seek undervalued assets with margin of safety. Focus on fundamentals, dividends, and long-term compounding. Idle cash beyond the reserve earns nothing — park it in BIL (T-bill ETF, ~4-5% yield) until you have a better use."
     preferred_metrics: ["PE", "PB", "DividendYield", "FCF"]
     horizon: "months to years"
     risk_profile:
@@ -189,6 +194,7 @@ accounts:
       - VTI
       - SCHD
       - VYM
+      - BIL              # T-bill ETF — parking for idle cash
 
   daily_momentum_nemotron:
     name: "Daily Momentum (Nemotron)"
@@ -200,7 +206,7 @@ accounts:
     decision_mode: "llm"   # LLM decides; RiskManager + cost filter remain hard guardrails
     strategy: "momentum"
     strategy_description: "Momentum/Swing: 20% ETF + 70% high-momentum stocks + 10% cash reserve"
-    prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength."
+    prompt_style: "Ride momentum, cut losers fast. Focus on technical breakouts, volume surges, and trend strength. Idle cash beyond the reserve earns nothing — park it in BIL (T-bill ETF, ~4-5% yield) until you have a better use."
     preferred_metrics: ["RSI", "MACD", "Volume", "BollingerBands"]
     horizon: "days to weeks"
     risk_profile:
@@ -221,6 +227,7 @@ accounts:
       - QQQ
       - SMH
       - IWM
+      - BIL              # T-bill ETF — parking for idle cash
 
   options_spreads_nemotron:
     name: "Wheel Strategy (Nemotron)"
@@ -228,7 +235,7 @@ accounts:
     model: "Nemotron"
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
-    cron: "40 18 * * 4"  # Friday 18:40 (staggered +20min vs Qwen)
+    cron: "40 18 * * 0,4"  # Mon+Fri 18:40 (staggered +20min vs Qwen)
     strategy: "wheel"
     strategy_description: "Wheel Strategy: sell cash-secured puts on quality underlyings; if assigned sell covered calls above cost basis"
     prompt_style: "Analyze IV regime and select the best underlyings for premium selling from the fixed watchlist (all affordable: 1 CSP contract fits the account). Use available cash — CSP collateral IS the cash."
@@ -265,7 +272,7 @@ accounts:
     model: "QWEN3.5"
     fallback_model: "Nemotron"
     broker_cost_model: "ibkr"
-    cron: "0 19 * * 4"    # Friday 19:00 CET
+    cron: "0 19 * * 0,4"  # Mon+Fri 19:00 CET — 2x/week so freed capital redeploys faster
     strategy: "vertical_spreads"
     strategy_description: "Multi-leg options spreads: iron condors, butterflies, bull/bear call/put spreads for defined-risk income"
     prompt_style: "Select optimal spread structures based on IV skew and directional bias. Use iron condors in neutral markets, butterflies for pinning targets, bull call/bear put spreads for directional plays."
@@ -289,7 +296,7 @@ accounts:
     model: "Nemotron"
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
-    cron: "20 19 * * 4"   # Friday 19:20 CET (staggered +20min vs Qwen)
+    cron: "20 19 * * 0,4"  # Mon+Fri 19:20 CET (staggered +20min vs Qwen)
     strategy: "vertical_spreads"
     strategy_description: "Multi-leg options spreads: iron condors, butterflies, bull/bear call/put spreads for defined-risk income"
     prompt_style: "Select optimal spread structures based on IV skew and directional bias. Use iron condors in neutral markets, butterflies for pinning targets, bull call/bear put spreads for directional plays."

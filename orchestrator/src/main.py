@@ -18,6 +18,7 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from .account_manager import AccountManager
+from .consensus import chat_json_consensus
 from .research_agent import ResearchAgent
 from .audit_logger import AuditLogger
 from .decision_parser import DecisionResult, parse_analysis, parse_decision
@@ -135,6 +136,11 @@ class Orchestrator:
 
     def _clear_retries(self, cycle_name: str, account_key: str) -> None:
         self._retry_attempts.pop(f"retry_{cycle_name}_{account_key}", None)
+
+    def _pass2_samples(self, acct: dict) -> int:
+        """Self-consistency sample count for Pass 2 (account > defaults > 1)."""
+        default = self.config.get("defaults", {}).get("pass2_samples", 1)
+        return int(acct.get("pass2_samples", default))
 
     def _load_config(self) -> None:
         with open(self.config_path) as f:
@@ -1083,9 +1089,10 @@ class Orchestrator:
                     strategy_config=acct,
                     risk_profile=risk_profile,
                 )
-                decision_raw = self.llm.chat_json(
-                    messages=synthesis_messages, model=model,
+                decision_raw = chat_json_consensus(
+                    self.llm, messages=synthesis_messages, model=model,
                     fallback_model=fallback, temperature=0.4,
+                    samples=self._pass2_samples(acct),
                 )
                 pass2_messages = synthesis_messages
                 decision = parse_decision(decision_raw)
@@ -1496,9 +1503,10 @@ class Orchestrator:
                     market_data=market_data,
                 )
 
-                decision_raw = self.llm.chat_json(
-                    messages=pass2_messages, model=model,
+                decision_raw = chat_json_consensus(
+                    self.llm, messages=pass2_messages, model=model,
                     fallback_model=fallback, temperature=0.5,
+                    samples=self._pass2_samples(acct),
                 )
                 spreads_decision = parse_spreads_decision(decision_raw)
                 logger.info(
@@ -1693,17 +1701,26 @@ class Orchestrator:
             quotes = self.market_data.get_quotes_batch(watchlist)
 
             # Affordability filter: drop symbols whose CSP collateral (price×100)
-            # exceeds available cash — the model shouldn't waste picks on them.
-            # Assigned symbols always stay (needed for covered-call data).
+            # exceeds deployable cash — the model shouldn't waste picks on them.
+            # Deployable = cash minus collateral already committed to open CSPs
+            # (Ghostfolio doesn't escrow it). Assigned symbols always stay
+            # (needed for covered-call data).
+            reserved_collateral = sum(
+                p.sell_strike * 100 * max(1, p.contracts or 1)
+                for p in active_positions
+                if p.spread_type == "CASH_SECURED_PUT" and p.sell_strike
+            )
+            deployable_cash = portfolio.cash - reserved_collateral
             unaffordable = [
                 sym for sym, q in quotes.items()
-                if sym not in assigned_symbols and q.price and q.price * 100 > portfolio.cash
+                if sym not in assigned_symbols and q.price and q.price * 100 > deployable_cash
             ]
             if unaffordable:
                 logger.info(
                     "options_watchlist_unaffordable_dropped",
                     account=account_name, symbols=unaffordable,
                     cash=round(portfolio.cash, 2),
+                    reserved_collateral=round(reserved_collateral, 2),
                 )
                 watchlist = [s for s in watchlist if s not in unaffordable]
                 quotes = {s: q for s, q in quotes.items() if s not in unaffordable}
@@ -1858,9 +1875,10 @@ class Orchestrator:
                     market_data=market_data,
                 )
 
-                decision_raw = self.llm.chat_json(
-                    messages=pass2_messages, model=model,
+                decision_raw = chat_json_consensus(
+                    self.llm, messages=pass2_messages, model=model,
                     fallback_model=fallback, temperature=0.5,
+                    samples=self._pass2_samples(acct),
                 )
                 options_decision = parse_options_decision(decision_raw)
                 logger.info(

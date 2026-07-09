@@ -146,7 +146,21 @@ class OptionsRiskManager:
         current_csp_count = sum(
             1 for p in open_csps if p.id not in closing_ids
         )
-        cash_available = cash   # we will decrement as we approve CSPs
+        # Reserve collateral of CSPs that stay open. Ghostfolio does not escrow
+        # CSP collateral (the premium lands in cash, the balance stays intact),
+        # so raw cash would let the account sell puts against the same dollars
+        # week after week — up to 5× over-leverage on a $10K account.
+        reserved_collateral = sum(
+            p.sell_strike * 100 * max(1, p.contracts or 1)
+            for p in open_csps
+            if p.id not in closing_ids and p.sell_strike
+        )
+        cash_available = cash - reserved_collateral   # decremented as we approve CSPs
+        if reserved_collateral > 0:
+            result.warnings.append(
+                f"Collateral reserved for {current_csp_count} open CSP(s): "
+                f"${reserved_collateral:,.0f} — deployable cash ${max(0, cash_available):,.0f}"
+            )
         md = market_data or {}
         # Track symbols already approved this cycle to prevent LLM from opening same symbol twice
         approved_csp_symbols = {p.symbol for p in open_csps if p.id not in closing_ids}
