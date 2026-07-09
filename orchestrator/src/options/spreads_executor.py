@@ -225,7 +225,7 @@ class SpreadsExecutor:
 
             self.tracker.update_position(
                 pos_id,
-                current_value=abs(spread.net_debit),
+                current_value=spread.net_debit,  # signed: negative = credit structure
                 current_pl=0.0,
                 greeks=net_greeks,
                 dte=spread.dte,
@@ -276,20 +276,35 @@ class SpreadsExecutor:
                     net_value += leg_price * sign
                 close_value = round(net_value, 2) if all_priced else None
             else:
-                # Legacy: single sell leg pricing
-                close_value = get_current_option_price(
+                # Legacy: single sell leg pricing (short option = liability,
+                # negate to the signed convention used by multi-leg pricing)
+                leg_price = get_current_option_price(
                     pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
                 )
+                close_value = -leg_price if leg_price is not None else None
             if close_value is None:
-                close_value = pos.current_value or abs(pos.entry_debit or 0)
+                # current_value and entry_debit are both signed, so falling back
+                # to entry_debit records a flat (P/L=0) close.
+                close_value = (pos.current_value if pos.current_value is not None
+                               else (pos.entry_debit or 0))
             else:
                 strikes = ([l.strike for l in all_legs] if all_legs
                            else [pos.buy_strike, pos.sell_strike])
                 close_value = self._clamp_value(close_value, strikes, pos.id, "close")
 
+            # Tracker/Ghostfolio convention: debit spreads store the (positive)
+            # liquidation value received on close; credit spreads store the
+            # (positive) cost paid to buy the spread back — same convention as
+            # the wheel executor, which close_position()'s P/L formula expects.
+            if (pos.entry_debit or 0) < 0:
+                close_value = round(-close_value, 2)
+
             ghostfolio_order_id = None
             if not self.dry_run:
-                ghostfolio_order_id = self._ghostfolio_close(pos, close_value)
+                ghostfolio_order_id = self._ghostfolio_close(
+                    pos, close_value,
+                    strikes=[l.strike for l in all_legs] if all_legs else None,
+                )
             else:
                 ghostfolio_order_id = "DRY_RUN"
                 logger.info(
@@ -339,6 +354,14 @@ class SpreadsExecutor:
 
             if dte == 0:
                 logger.info("spread_position_expired", pos_id=pos.id, symbol=pos.symbol)
+                # Record the expiry in Ghostfolio too, or the synthetic holding
+                # stays open forever and becomes a phantom position.
+                if not self.dry_run:
+                    exp_legs = self.tracker.get_legs(pos.id)
+                    self._ghostfolio_close(
+                        pos, 0.0,
+                        strikes=[l.strike for l in exp_legs] if exp_legs else None,
+                    )
                 self.tracker.expire_position(pos.id)
                 return SpreadsTradeResult(
                     action="UPDATE", symbol=pos.symbol,
@@ -386,30 +409,29 @@ class SpreadsExecutor:
                     )
                 current_value = round(buy_price - sell_price, 2)
             else:
-                # Single-leg (CSP/CC): sell leg only
-                current_value = get_current_option_price(
+                # Single-leg (CSP/CC): sell leg only. Negate to the signed
+                # convention — a short option is a liability we pay to close.
+                leg_price = get_current_option_price(
                     pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
                 )
-                if current_value is None:
+                if leg_price is None:
                     return SpreadsTradeResult(
                         action="UPDATE", symbol=pos.symbol,
                         spread_type=pos.spread_type,
                         position_id=pos.id, success=False,
                         error="Could not fetch current option price",
                     )
+                current_value = -leg_price
 
             strikes = ([l.strike for l in all_legs] if all_legs
                        else [pos.buy_strike, pos.sell_strike])
             current_value = self._clamp_value(current_value, strikes, pos.id, "update")
 
-            # P&L depends on whether it's a debit or credit spread
-            if entry_debit > 0:
-                # Debit spread: P&L = (current_value - entry_debit) * contracts * 100
-                current_pl = round((current_value - entry_debit) * pos.contracts * 100, 2)
-            else:
-                # Credit spread / CSP: P&L = (|entry_credit| - current_value) * contracts * 100
-                entry_credit = abs(entry_debit)
-                current_pl = round((entry_credit - current_value) * pos.contracts * 100, 2)
+            # current_value is the SIGNED liquidation value (negative = we must
+            # pay to close, i.e. credit structures), and entry_debit uses the
+            # same convention (negative = credit received), so one formula
+            # covers both debit and credit spreads.
+            current_pl = round((current_value - entry_debit) * pos.contracts * 100, 2)
 
             self.tracker.update_position(
                 pos.id,
@@ -461,26 +483,39 @@ class SpreadsExecutor:
 
     # -- Ghostfolio helpers --
 
-    def _ghostfolio_open(self, spread: SelectedSpread) -> str | None:
-        """Record spread open in Ghostfolio as a BUY of a synthetic asset.
+    @staticmethod
+    def _gf_symbol(underlying: str, spread_type: str, expiration: str, strikes: list) -> str:
+        """Synthetic Ghostfolio symbol for a spread.
 
-        Debit spread = paying cash to open → BUY (correct direction).
+        Open and close MUST produce the identical symbol or Ghostfolio ends up
+        with two profiles (a phantom +1 holding and an orphan -1). Both paths
+        build it from the full leg strike list in leg order.
+        """
+        exp_compact = expiration.replace("-", "")
+        strikes_part = "-".join(f"{int(s)}" for s in strikes)
+        return f"GF_SPREAD-{underlying}-{spread_type.upper()}-{exp_compact}-{strikes_part}"[:50]
+
+    def _ghostfolio_open(self, spread: SelectedSpread) -> str | None:
+        """Record spread open in Ghostfolio.
+
+        Debit spread = paying cash to open → BUY.
+        Credit spread = receiving cash at open → SELL (mirrors the wheel
+        executor's CSP model; the earlier BUY-for-credit model inverted the
+        account's cash P/L on every credit spread).
         Unit price × 100: spread price is per share, 1 contract = 100 shares.
         """
         try:
-            exp_compact = spread.expiration.replace("-", "")
-            strikes = "-".join(f"{int(l.strike)}" for l in spread.legs)
-            symbol = f"GF_SPREAD-{spread.symbol}-{spread.spread_type.upper()}-{exp_compact}-{strikes}"
-            symbol = symbol[:50]
-
+            symbol = self._gf_symbol(
+                spread.symbol, spread.spread_type, spread.expiration,
+                [l.strike for l in spread.legs],
+            )
             raw_debit = abs(spread.net_debit) if spread.net_debit != 0 else 0.01
-            unit_price = round(raw_debit * 100, 2)
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
-                order_type="BUY",
+                order_type="SELL" if spread.net_debit < 0 else "BUY",
                 quantity=float(spread.contracts),
-                unit_price=unit_price,
+                unit_price=round(raw_debit * 100, 2),
                 data_source="MANUAL",
             )
             return result.get("id") if isinstance(result, dict) else None
@@ -488,26 +523,26 @@ class SpreadsExecutor:
             logger.error("ghostfolio_spread_open_failed", symbol=spread.symbol, error=str(e))
             return None
 
-    def _ghostfolio_close(self, pos: OptionsPosition, close_value: float) -> str | None:
-        """Record spread close as a SELL in Ghostfolio.
+    def _ghostfolio_close(
+        self, pos: OptionsPosition, close_value: float, strikes: list | None = None,
+    ) -> str | None:
+        """Record spread close in Ghostfolio.
 
-        Closing a debit spread = receiving cash back → SELL (correct direction).
-        Unit price × 100: spread price is per share, 1 contract = 100 shares.
+        close_value is in tracker convention (positive): debit spread → value
+        received on close → SELL; credit spread → cost paid to buy back → BUY.
+        Net cash across open+close then equals the realized P/L for both types.
         """
         try:
-            exp_compact = pos.expiration_date.replace("-", "")
-            symbol = (
-                f"GF_SPREAD-{pos.symbol}-{pos.spread_type}-{exp_compact}-"
-                f"{int(pos.buy_strike)}-{int(pos.sell_strike)}"
+            symbol = self._gf_symbol(
+                pos.symbol, pos.spread_type, pos.expiration_date,
+                strikes or [pos.buy_strike, pos.sell_strike],
             )
-            symbol = symbol[:50]
-
             result = self.ghostfolio.create_order(
                 account_id=self.account_id,
                 symbol=symbol,
-                order_type="SELL",
+                order_type="BUY" if (pos.entry_debit or 0) < 0 else "SELL",
                 quantity=float(pos.contracts),
-                unit_price=round(close_value * 100, 2),
+                unit_price=max(round(close_value * 100, 2), 0.01),
                 data_source="MANUAL",
             )
             return result.get("id") if isinstance(result, dict) else None

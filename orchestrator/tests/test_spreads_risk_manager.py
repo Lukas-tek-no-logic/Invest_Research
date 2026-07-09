@@ -1,5 +1,8 @@
 """Tests for options/spreads_risk_manager.py."""
 
+from datetime import date, timedelta
+from types import SimpleNamespace
+
 from orchestrator.src.options.spreads_decision_parser import SpreadAction, SpreadDecision
 from orchestrator.src.options.spreads_risk_manager import SpreadsRiskManager
 from orchestrator.src.options.positions import OptionsPosition
@@ -19,7 +22,7 @@ def _make_portfolio(cash=5000, total_value=10000):
 def _make_position(
     id=1, symbol="SPY", spread_type="IRON_CONDOR",
     dte=30, current_pl=None, max_profit=100, max_loss=200,
-    entry_debit=-1.0, profit_captured=None,
+    entry_debit=-1.0, profit_captured=None, entry_date="2026-02-01",
 ):
     pos = OptionsPosition(
         id=id, account_key="test", symbol=symbol,
@@ -29,7 +32,7 @@ def _make_position(
         buy_premium=1.0, sell_strike=555.0,
         sell_option_type="put", sell_premium=2.0,
         max_profit=max_profit, max_loss=max_loss,
-        entry_debit=entry_debit, entry_date="2026-02-01",
+        entry_debit=entry_debit, entry_date=entry_date,
         dte=dte, current_pl=current_pl,
     )
     return pos
@@ -245,3 +248,112 @@ class TestSpreadsRiskManagerCashAccounting:
         result = mgr.validate(decision, [], portfolio)
         assert len(result.approved_opens) == 2
         assert len(result.rejected_opens) == 1
+
+
+class TestSpreadsExitDiscipline:
+    """min_holding_days gating and short-strike breach exits."""
+
+    def _mgr(self, **overrides):
+        return SpreadsRiskManager({**RISK_PROFILE, "min_holding_days": 5, **overrides})
+
+    def test_no_mark_based_exit_before_min_holding(self):
+        """Fresh position: noisy marks must not trigger TP or SL."""
+        mgr = self._mgr()
+        pos = _make_position(
+            current_pl=90, entry_date=date.today().isoformat(),  # "90% captured"
+        )
+        assert mgr.check_position_exits(pos) is None
+
+        pos_loss = _make_position(
+            current_pl=-250, entry_date=date.today().isoformat(),  # > max_loss stop
+        )
+        assert mgr.check_position_exits(pos_loss) is None
+
+    def test_take_profit_after_min_holding(self):
+        mgr = self._mgr()
+        pos = _make_position(
+            current_pl=90,
+            entry_date=(date.today() - timedelta(days=6)).isoformat(),
+        )
+        forced = mgr.check_position_exits(pos)
+        assert forced is not None and "Take-profit" in forced.reason
+
+    def test_stop_loss_after_min_holding(self):
+        mgr = self._mgr(stop_loss_pct=50)
+        pos = _make_position(
+            current_pl=-150, max_loss=200,
+            entry_date=(date.today() - timedelta(days=6)).isoformat(),
+        )
+        forced = mgr.check_position_exits(pos)
+        assert forced is not None and "Stop-loss" in forced.reason
+
+    def test_short_strike_breach_overrides_min_holding(self):
+        """Real directional threat closes immediately, even on day one."""
+        mgr = self._mgr()
+        # Credit position, short put 555 — spot below the strike = breach
+        pos = _make_position(entry_date=date.today().isoformat())
+        forced = mgr.check_position_exits(pos, spot=550.0)
+        assert forced is not None and "breach" in forced.reason.lower()
+
+    def test_no_breach_when_spot_safe(self):
+        mgr = self._mgr()
+        pos = _make_position(entry_date=date.today().isoformat())
+        assert mgr.check_position_exits(pos, spot=560.0) is None
+
+    def test_dte_close_ignores_min_holding(self):
+        mgr = self._mgr()
+        pos = _make_position(dte=2, entry_date=date.today().isoformat())
+        forced = mgr.check_position_exits(pos)
+        assert forced is not None and "DTE" in forced.reason
+
+    def test_breach_ignored_for_debit_spreads(self):
+        """Breach logic applies to credit structures only."""
+        mgr = self._mgr()
+        pos = _make_position(entry_debit=2.5, entry_date=date.today().isoformat())
+        assert mgr.check_position_exits(pos, spot=550.0) is None
+
+
+class TestTrendConsistencyFilter:
+    """Directional spreads must not fight a clear trend."""
+
+    def _decision(self, spread_type, symbol="NVDA"):
+        return SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol=symbol,
+                         spread_type=spread_type, contracts=1, reason="setup"),
+        ])
+
+    def test_reject_bear_spread_in_uptrend(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        signals = {"NVDA": SimpleNamespace(price=200.0, sma_50=180.0, rsi_14=65.0)}
+        result = mgr.validate(self._decision("bear_call"), [], _make_portfolio(),
+                              tech_signals=signals)
+        assert len(result.approved_opens) == 0
+        assert "against uptrend" in result.rejected_opens[0]["reason"]
+
+    def test_reject_bull_spread_in_downtrend(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        signals = {"NVDA": SimpleNamespace(price=150.0, sma_50=180.0, rsi_14=38.0)}
+        result = mgr.validate(self._decision("bull_put"), [], _make_portfolio(),
+                              tech_signals=signals)
+        assert len(result.approved_opens) == 0
+        assert "against downtrend" in result.rejected_opens[0]["reason"]
+
+    def test_allow_bear_spread_when_trend_down(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        signals = {"NVDA": SimpleNamespace(price=150.0, sma_50=180.0, rsi_14=38.0)}
+        result = mgr.validate(self._decision("bear_call"), [], _make_portfolio(),
+                              tech_signals=signals)
+        assert len(result.approved_opens) == 1
+
+    def test_neutral_structure_ignores_trend(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        signals = {"NVDA": SimpleNamespace(price=200.0, sma_50=180.0, rsi_14=65.0)}
+        result = mgr.validate(self._decision("iron_condor"), [], _make_portfolio(),
+                              tech_signals=signals)
+        assert len(result.approved_opens) == 1
+
+    def test_missing_signals_pass(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        result = mgr.validate(self._decision("bear_call"), [], _make_portfolio(),
+                              tech_signals=None)
+        assert len(result.approved_opens) == 1

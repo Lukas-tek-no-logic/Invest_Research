@@ -1,5 +1,6 @@
 """Tests for options/spreads_executor.py."""
 
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 from orchestrator.src.options.spreads_decision_parser import SpreadAction
@@ -58,10 +59,13 @@ def _make_selected_spread():
 
 
 def _make_position(id=1, symbol="SPY", dte=20):
+    # expiration derived from dte so the executor's own DTE computation
+    # (expiration vs today) matches and never silently hits the expiry path
+    expiration = (date.today() + timedelta(days=dte)).isoformat()
     return OptionsPosition(
         id=id, account_key="test_key", symbol=symbol,
         spread_type="IRON_CONDOR", status="open",
-        contracts=1, expiration_date="2026-04-01",
+        contracts=1, expiration_date=expiration,
         buy_strike=530.0, buy_option_type="put",
         buy_premium=1.50, sell_strike=535.0,
         sell_option_type="put", sell_premium=2.50,
@@ -191,9 +195,10 @@ class TestSpreadsExecutorUpdates:
 
     @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
     def test_update_credit_spread(self, mock_price):
-        """Credit spread: P&L = (|entry_credit| - current_value) * contracts * 100."""
-        # Two-leg spread: buy_price=2.0, sell_price=1.0 → current_value = 2.0 - 1.0 = 1.0
-        mock_price.side_effect = [2.0, 1.0]
+        """Credit spread: signed value, universal P&L = (value - entry_debit) * 100."""
+        # Two-leg spread: buy_price=1.0, sell_price=2.5
+        # → signed current_value = 1.0 - 2.5 = -1.5 (we'd pay 1.5 to close)
+        mock_price.side_effect = [1.0, 2.5]
         executor, _, mock_tracker = _make_executor()
 
         # entry_debit=-2.0 means credit of $2.00 received
@@ -206,9 +211,9 @@ class TestSpreadsExecutorUpdates:
         mock_tracker.update_position.assert_called_once()
         call_args = mock_tracker.update_position.call_args
         assert call_args[0][0] == 1  # position_id
-        assert call_args[1]["current_value"] == 1.0
-        # P&L for credit: (2.0 - 1.0) * 1 * 100 = 100.0
-        assert call_args[1]["current_pl"] == 100.0
+        assert call_args[1]["current_value"] == -1.5
+        # P&L: received 2.00 at open, pay 1.50 to close → (-1.5 - (-2.0)) * 100 = +50
+        assert call_args[1]["current_pl"] == 50.0
 
     @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
     def test_update_no_price(self, mock_price):
@@ -265,3 +270,114 @@ class TestSpreadsExecutorMultiple:
         assert len(results) == 2
         assert results[0].success is True
         assert results[1].success is False
+
+
+class TestSpreadsGhostfolioAccounting:
+    """Cash-flow direction and symbol consistency of synthetic Ghostfolio orders.
+
+    Regression tests for the credit-spread accounting bug: opens were recorded
+    as BUY regardless of debit/credit, which inverted the account's cash P/L
+    on every credit spread, and open/close built different symbols for
+    multi-leg spreads, leaving phantom holdings.
+    """
+
+    @patch("orchestrator.src.options.spreads_executor.select_spread")
+    def test_credit_open_records_sell(self, mock_select):
+        mock_select.return_value = _make_selected_spread()  # net_debit=-2.0
+        executor, mock_gf, _ = _make_executor()
+
+        executor.execute_opens([SpreadAction(
+            type="OPEN_SPREAD", symbol="SPY", spread_type="iron_condor", contracts=1,
+        )])
+
+        kwargs = mock_gf.create_order.call_args.kwargs
+        assert kwargs["order_type"] == "SELL"  # credit received = cash in
+        assert kwargs["unit_price"] == 200.0
+        assert kwargs["symbol"] == "GF_SPREAD-SPY-IRON_CONDOR-20260401-530-535-565-570"
+
+    @patch("orchestrator.src.options.spreads_executor.select_spread")
+    def test_debit_open_records_buy(self, mock_select):
+        spread = _make_selected_spread()
+        spread.net_debit = 3.0  # debit paid
+        mock_select.return_value = spread
+        executor, mock_gf, _ = _make_executor()
+
+        executor.execute_opens([SpreadAction(
+            type="OPEN_SPREAD", symbol="SPY", spread_type="iron_condor", contracts=1,
+        )])
+
+        kwargs = mock_gf.create_order.call_args.kwargs
+        assert kwargs["order_type"] == "BUY"
+        assert kwargs["unit_price"] == 300.0
+
+    @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
+    def test_credit_close_records_buy_at_cost(self, mock_price):
+        from orchestrator.src.options.positions import OptionLeg
+        # Condor legs: buy put 530, sell put 535, sell call 565, buy call 570
+        legs = [
+            OptionLeg(position_id=5, leg_index=0, option_type="put", side="buy", strike=530.0),
+            OptionLeg(position_id=5, leg_index=1, option_type="put", side="sell", strike=535.0),
+            OptionLeg(position_id=5, leg_index=2, option_type="call", side="sell", strike=565.0),
+            OptionLeg(position_id=5, leg_index=3, option_type="call", side="buy", strike=570.0),
+        ]
+        # signed value = 0.5 - 1.0 - 1.0 + 0.5 = -1.0 → cost to close = 1.0
+        mock_price.side_effect = [0.5, 1.0, 1.0, 0.5]
+        executor, mock_gf, mock_tracker = _make_executor()
+        mock_tracker.get_legs.return_value = legs
+
+        pos = _make_position(id=5)  # entry_debit=-2.0 (credit)
+        executor.execute_closes(
+            [SpreadAction(type="CLOSE", symbol="SPY", position_id=5, reason="tp")], [pos],
+        )
+
+        kwargs = mock_gf.create_order.call_args.kwargs
+        assert kwargs["order_type"] == "BUY"  # buying the spread back = cash out
+        assert kwargs["unit_price"] == 100.0
+        exp_compact = pos.expiration_date.replace("-", "")
+        assert kwargs["symbol"] == f"GF_SPREAD-SPY-IRON_CONDOR-{exp_compact}-530-535-565-570"
+        # Tracker gets the positive cost-to-close (wheel convention)
+        close_args = mock_tracker.close_position.call_args
+        assert close_args[0][1] == 1.0
+
+    @patch("orchestrator.src.options.spreads_executor.select_spread")
+    @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
+    def test_open_close_symbols_match(self, mock_price, mock_select):
+        """Open and close must hit the same Ghostfolio profile."""
+        from orchestrator.src.options.positions import OptionLeg
+        spread = _make_selected_spread()
+        mock_select.return_value = spread
+        executor, mock_gf, mock_tracker = _make_executor()
+
+        executor.execute_opens([SpreadAction(
+            type="OPEN_SPREAD", symbol="SPY", spread_type="iron_condor", contracts=1,
+        )])
+        open_symbol = mock_gf.create_order.call_args.kwargs["symbol"]
+
+        mock_tracker.get_legs.return_value = [
+            OptionLeg(position_id=5, leg_index=i, option_type=l.option_type,
+                      side=l.side, strike=l.strike)
+            for i, l in enumerate(spread.legs)
+        ]
+        mock_price.side_effect = [0.5, 1.0, 1.0, 0.5]
+        pos = _make_position(id=5)
+        pos.expiration_date = spread.expiration
+        pos.spread_type = spread.spread_type.upper()
+        executor.execute_closes(
+            [SpreadAction(type="CLOSE", symbol="SPY", position_id=5, reason="tp")], [pos],
+        )
+        close_symbol = mock_gf.create_order.call_args.kwargs["symbol"]
+
+        assert open_symbol == close_symbol
+
+    @patch("orchestrator.src.options.spreads_executor.get_current_option_price")
+    def test_expiry_records_ghostfolio_close(self, mock_price):
+        """Expired positions must be closed in Ghostfolio too, not only in the tracker."""
+        executor, mock_gf, mock_tracker = _make_executor()
+
+        pos = _make_position(id=7, dte=0)  # expiration = today
+        executor.update_active_positions([pos])
+
+        mock_tracker.expire_position.assert_called_once_with(7)
+        kwargs = mock_gf.create_order.call_args.kwargs
+        assert kwargs["order_type"] == "BUY"  # credit position: buy back at ~0
+        assert kwargs["unit_price"] == 0.01

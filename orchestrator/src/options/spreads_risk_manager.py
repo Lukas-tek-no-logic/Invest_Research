@@ -9,6 +9,7 @@ Produces a SpreadsRiskResult consumed by main.py's run_spreads_cycle().
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import date, datetime
 
 import structlog
 
@@ -43,6 +44,12 @@ class SpreadsRiskManager:
         self.auto_close_dte: int = risk_profile.get("auto_close_dte", 3)
         self.target_dte_min: int = risk_profile.get("target_dte_min", 21)
         self.target_dte_max: int = risk_profile.get("target_dte_max", 45)
+        # Mark-based exits (take-profit / stop-loss) are suppressed for this
+        # many days after entry: option mids are noisy, and a spread designed
+        # for DTE 21-45 that gets closed on the first Monday after entry pays
+        # two bid-ask spreads for nothing. Structural exits (DTE, short-strike
+        # breach) stay active from day one.
+        self.min_holding_days: int = risk_profile.get("min_holding_days", 5)
 
     def validate(
         self,
@@ -51,6 +58,7 @@ class SpreadsRiskManager:
         portfolio: PortfolioState,
         portfolio_greeks=None,
         market_data: dict | None = None,
+        tech_signals: dict | None = None,
     ) -> SpreadsRiskResult:
         result = SpreadsRiskResult()
         account_value = portfolio.total_value or 1.0
@@ -67,7 +75,8 @@ class SpreadsRiskManager:
         for pos in active_positions:
             if pos.id in llm_close_ids:
                 continue
-            forced = self._auto_close_check(pos)
+            spot = (market_data or {}).get(pos.symbol, {}).get("price")
+            forced = self.check_position_exits(pos, spot=spot)
             if forced is not None:
                 result.forced_closes.append(forced)
                 result.modifications.append(
@@ -142,6 +151,19 @@ class SpreadsRiskManager:
                 result.modifications.append(f"[REJECTED] {symbol}: {reason}")
                 continue
 
+            # 4. Trend consistency: don't fight a clear trend with a
+            # directional spread (repeated bear calls on trending AI names
+            # were the single biggest loss source).
+            trend_reason = _against_trend_reason(
+                action.spread_type, (tech_signals or {}).get(symbol),
+            )
+            if trend_reason:
+                result.rejected_opens.append({"instruction": action, "reason": trend_reason})
+                result.modifications.append(
+                    f"[REJECTED] {symbol} {action.spread_type}: {trend_reason}"
+                )
+                continue
+
             # Approved
             result.approved_opens.append(action)
             approved_spread_symbols.add(symbol)
@@ -167,8 +189,16 @@ class SpreadsRiskManager:
 
         return result
 
-    def _auto_close_check(self, pos: OptionsPosition) -> SpreadAction | None:
-        """Return a forced-close SpreadAction if auto-close rules trigger."""
+    def check_position_exits(
+        self, pos: OptionsPosition, spot: float | None = None,
+    ) -> SpreadAction | None:
+        """Return a forced-close SpreadAction if exit rules trigger.
+
+        Structural rules (always active): DTE threshold, spot breaching the
+        short strike of a credit structure.
+        Mark-based rules (only after min_holding_days): take-profit, stop-loss
+        as % of max loss.
+        """
 
         # DTE expiry threshold
         if pos.dte is not None and pos.dte <= self.auto_close_dte:
@@ -178,6 +208,30 @@ class SpreadsRiskManager:
                 position_id=pos.id,
                 reason=f"DTE={pos.dte} <= auto-close threshold ({self.auto_close_dte})",
             )
+
+        # Short-strike breach on credit structures: the position is under real
+        # directional threat regardless of what the (noisy) marks say.
+        if (pos.entry_debit or 0) < 0 and spot is not None and pos.sell_strike > 0:
+            breached = (
+                spot > pos.sell_strike
+                if pos.sell_option_type == "call"
+                else spot < pos.sell_strike
+            )
+            if breached:
+                return SpreadAction(
+                    type="CLOSE",
+                    symbol=pos.symbol,
+                    position_id=pos.id,
+                    reason=(
+                        f"Short-strike breach: spot {spot:.2f} beyond short "
+                        f"{pos.sell_option_type} {pos.sell_strike}"
+                    ),
+                )
+
+        # Mark-based exits are unreliable right after entry — skip them until
+        # the position has had time to develop.
+        if self._held_days(pos) < self.min_holding_days:
+            return None
 
         # Take-profit
         captured = pos.profit_captured_pct
@@ -201,6 +255,46 @@ class SpreadsRiskManager:
                 )
 
         return None
+
+    @staticmethod
+    def _held_days(pos: OptionsPosition) -> int:
+        try:
+            entry = datetime.strptime(pos.entry_date, "%Y-%m-%d").date()
+            return (date.today() - entry).days
+        except (TypeError, ValueError):
+            return 0
+
+
+_BEARISH_SPREADS = {"BEAR_CALL", "BEAR_PUT"}
+_BULLISH_SPREADS = {"BULL_CALL", "BULL_PUT"}
+
+
+def _against_trend_reason(spread_type: str, signals) -> str | None:
+    """Return a rejection reason if a directional spread fights a clear trend.
+
+    Uses price vs SMA50 confirmed by RSI; with missing data nothing is
+    rejected. Neutral structures (iron condors, butterflies) always pass.
+    """
+    st = (spread_type or "").upper()
+    if st not in _BEARISH_SPREADS and st not in _BULLISH_SPREADS:
+        return None
+    price = getattr(signals, "price", None)
+    sma_50 = getattr(signals, "sma_50", None)
+    rsi = getattr(signals, "rsi_14", None)
+    if not price or not sma_50 or rsi is None:
+        return None
+
+    if st in _BEARISH_SPREADS and price > sma_50 and rsi >= 55:
+        return (
+            f"Bearish spread against uptrend: price {price:.2f} > SMA50 "
+            f"{sma_50:.2f}, RSI {rsi:.0f}"
+        )
+    if st in _BULLISH_SPREADS and price < sma_50 and rsi <= 45:
+        return (
+            f"Bullish spread against downtrend: price {price:.2f} < SMA50 "
+            f"{sma_50:.2f}, RSI {rsi:.0f}"
+        )
+    return None
 
 
 def _earnings_flag_in_reason(reason: str) -> bool:

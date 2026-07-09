@@ -183,7 +183,32 @@ class Orchestrator:
 
                 # Check for take-profit, auto-close, and near-ATM danger triggers
                 closes_needed = []
-                for pos in active:
+                maintenance_reasons: dict[int, str] = {}
+                if self._is_spreads_account(acct):
+                    # Spreads use the same exit rules as the weekly cycle:
+                    # DTE / short-strike breach always, mark-based take-profit
+                    # and stop-loss only after min_holding_days.
+                    risk_mgr = SpreadsRiskManager(risk_profile)
+                    for pos in active:
+                        try:
+                            spot = self.market_data.get_current_price(pos.symbol)
+                        except Exception:
+                            spot = None
+                        forced = risk_mgr.check_position_exits(pos, spot=spot)
+                        if forced is not None:
+                            closes_needed.append(pos)
+                            maintenance_reasons[pos.id] = forced.reason
+                            logger.info(
+                                "maintenance_spread_exit",
+                                account=account_name,
+                                symbol=pos.symbol,
+                                reason=forced.reason,
+                            )
+                    active_for_checks = []
+                else:
+                    active_for_checks = active
+
+                for pos in active_for_checks:
                     captured = pos.profit_captured_pct
                     if captured is not None and captured >= take_profit_pct:
                         closes_needed.append(pos)
@@ -228,8 +253,12 @@ class Orchestrator:
                             type="CLOSE",
                             symbol=pos.symbol,
                             position_id=pos.id,
-                            reason=f"Maintenance: "
-                                   f"{'take-profit ' + str(round(pos.profit_captured_pct or 0)) + '%' if (pos.profit_captured_pct or 0) >= take_profit_pct else 'DTE=' + str(pos.dte)}",
+                            reason="Maintenance: " + maintenance_reasons.get(
+                                pos.id,
+                                ('take-profit ' + str(round(pos.profit_captured_pct or 0)) + '%'
+                                 if (pos.profit_captured_pct or 0) >= take_profit_pct
+                                 else 'DTE=' + str(pos.dte)),
+                            ),
                         )
                         for pos in closes_needed
                     ]
@@ -1461,6 +1490,7 @@ class Orchestrator:
                 portfolio=portfolio,
                 portfolio_greeks=portfolio_greeks,
                 market_data=market_data,
+                tech_signals=tech_signals,
             )
 
             for w in risk_result.warnings:
