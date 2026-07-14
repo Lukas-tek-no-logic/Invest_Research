@@ -40,7 +40,7 @@ from .prompt_builder import (
     format_decision_history,
     format_trade_journal,
 )
-from .regime import RegimeResult, compute_regime
+from .regime import RegimeResult, compute_regime, load_regime_state, save_regime_state
 from .self_critique import ReflectionEngine
 from .rag_client import RagClient
 from .fundamental_data import format_fundamentals_for_prompt, get_fundamentals_batch
@@ -159,8 +159,9 @@ class Orchestrator:
     def _get_regime(self) -> RegimeResult | None:
         """Compute the market regime from VIX + SPY data (cached 15 min).
 
-        Returns None when data is unavailable — callers fall back to the
-        LLM's own classification (the pre-2026-07-09 behavior).
+        Fallback order on data failure: persisted state file (≤24h, marked
+        stale — steers prompts but never the exposure floor) → None (callers
+        fall back to the LLM's own classification, the pre-2026-07-09 behavior).
         """
         if self._regime_cache and (time.time() - self._regime_cache[0]) < self._REGIME_CACHE_TTL:
             return self._regime_cache[1]
@@ -170,7 +171,13 @@ class Orchestrator:
             result = compute_regime(list(vix_df["Close"]), list(spy_df["Close"]))
         except Exception as e:
             logger.warning("deterministic_regime_failed", error=str(e))
+            stale = load_regime_state()
+            if stale:
+                logger.info("regime_stale_fallback", regime=stale.regime)
+                self._regime_cache = (time.time(), stale)
+                return stale
             return None
+        save_regime_state(result)
         self._regime_cache = (time.time(), result)
         return result
 
@@ -261,6 +268,118 @@ class Orchestrator:
                     except Exception as e:
                         logger.warning("cash_sweep_balance_update_failed",
                                        account=account_name, error=str(e))
+
+    # ── Daily equity guardian (stop-losses between decision cycles) ───────
+
+    def run_equity_guardian(self) -> None:
+        """Enforce per-position stop-losses for every equity account, daily.
+
+        Weekly/monthly accounts otherwise only evaluate stops in their own
+        cycles — a Monday crash would leave their positions unguarded for up
+        to a week (or a month). Mechanical and sell-only: no LLM, no zombie
+        cleanup, and deliberately NO portfolio-drawdown reduction — repeated
+        daily, that check would liquidate a crashed portfolio 50% at a time
+        into the bottom. Drawdown reduction stays in the decision cycles.
+        """
+        self._load_config()
+        for key, acct in self.config.get("accounts", {}).items():
+            if not acct or acct.get("enabled") is False:
+                continue
+            if self._is_options_account(acct) or acct.get("cycle_type") == "research":
+                continue
+            account_id = acct.get("ghostfolio_account_id", "")
+            if not account_id:
+                continue
+            account_name = acct.get("name", key)
+            risk_profile = acct.get("risk_profile", {})
+
+            try:
+                portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            except ValuationUnavailable as e:
+                logger.warning("guardian_skipped", account=account_name, error=str(e))
+                continue
+
+            forced = RiskManager(risk_profile)._check_stop_losses(portfolio)
+            if not forced:
+                continue
+
+            logger.warning(
+                "guardian_stop_losses_triggered",
+                account=account_name,
+                symbols=[a.symbol for a in forced],
+            )
+            executor = TradeExecutor(
+                self.ghostfolio, self.market_data, dry_run=self.dry_run,
+                broker_cost_model=acct.get("broker_cost_model", ""),
+            )
+            results = executor.execute_trades(forced, account_id)
+
+            executed_trades = []
+            fees_paid = 0.0
+            for r in results:
+                fees_paid += r.fee
+                executed_trades.append({
+                    "type": r.action.type, "symbol": r.action.symbol,
+                    "quantity": r.quantity, "price": r.unit_price,
+                    "total": r.total_cost, "fee": r.fee,
+                    "success": r.success, "error": r.error,
+                    "order_id": r.ghostfolio_order_id,
+                })
+                if r.success and r.action.symbol not in CASH_EQUIVALENT_SYMBOLS:
+                    pos = portfolio.get_position(r.action.symbol)
+                    if pos and pos.avg_cost > 0:
+                        self.audit.log_closed_trade(
+                            account_key=key,
+                            symbol=r.action.symbol,
+                            quantity=r.quantity,
+                            entry_price=pos.avg_cost,
+                            exit_price=r.unit_price,
+                            entry_date=pos.first_buy_date,
+                            thesis=r.action.thesis,
+                        )
+
+            # Sync canonical cash after real sells (same policy as run_cycle)
+            new_cash = portfolio.cash
+            if not self.dry_run and any(t.get("success") for t in executed_trades):
+                initial_budget = acct.get(
+                    "initial_budget",
+                    self.config.get("defaults", {}).get("initial_budget", 10000),
+                )
+                canonical = compute_cash_from_orders(self.ghostfolio, account_id, initial_budget)
+                if canonical is not None:
+                    new_cash = canonical
+                    try:
+                        self.ghostfolio.update_account(account_id, balance=new_cash)
+                    except Exception as e:
+                        logger.warning("guardian_balance_update_failed",
+                                       account=account_name, error=str(e))
+
+            self.audit.log_cycle(
+                account_key=key,
+                account_name=account_name,
+                model="guardian",
+                pass1_response={"market_regime": "GUARDIAN"},
+                pass2_response={"portfolio_outlook": "N/A", "actions": []},
+                forced_actions=[
+                    {"type": a.type, "symbol": a.symbol, "amount": a.amount_usd,
+                     "thesis": a.thesis}
+                    for a in forced
+                ],
+                executed_trades=executed_trades,
+                portfolio_before={
+                    "total_value": portfolio.total_value, "cash": portfolio.cash,
+                    "positions": portfolio.position_count,
+                    "total_pl_pct": portfolio.total_pl_pct,
+                },
+                portfolio_after={
+                    "total_value": portfolio.total_value, "cash": new_cash,
+                    "positions": portfolio.position_count - sum(
+                        1 for t in executed_trades if t.get("success")
+                    ),
+                    "total_pl_pct": portfolio.total_pl_pct,
+                },
+                fees_paid=fees_paid,
+            )
 
     def _load_config(self) -> None:
         with open(self.config_path) as f:
@@ -1258,11 +1377,17 @@ class Orchestrator:
             logger.info("phase4_risk_validation", account=account_name)
 
             risk_mgr = RiskManager(risk_profile)
+            # A stale (file-fallback) regime steers the prompts but must not
+            # drive the floor — no mechanical buying on yesterday's label.
+            floor_regime = (
+                regime_result.regime
+                if regime_result and not regime_result.stale else None
+            )
             risk_result: RiskManagerResult = risk_mgr.validate(
                 decision=decision,
                 portfolio=portfolio,
                 quotes={s: q for s, q in quotes.items()},
-                regime=regime_result.regime if regime_result else None,
+                regime=floor_regime,
                 core_symbols=acct.get("watchlist", []),
             )
 
@@ -2329,15 +2454,27 @@ def main():
     )
     logger.info("scheduler_options_maintenance_added", cron="0 17 * * *")
 
-    # Daily cash sweep (20:50 — after all equity cycles): park idle cash in T-bills
+    # Daily equity guardian (Mon-Fri 21:30, ~30 min before NYSE close):
+    # stop-loss enforcement for ALL equity accounts between decision cycles.
+    scheduler.add_job(
+        orch.run_equity_guardian,
+        trigger=CronTrigger(day_of_week="mon-fri", hour=21, minute=30, timezone="Europe/Warsaw"),
+        id="equity_guardian",
+        name="Daily equity guardian (stop-losses)",
+        misfire_grace_time=1800,
+    )
+    logger.info("scheduler_equity_guardian_added", cron="30 21 * * 1-5")
+
+    # Daily cash sweep (21:45 — after Sunday weekly cycles end ~20:55 and after
+    # the 21:30 guardian, so its sale proceeds park the same evening)
     scheduler.add_job(
         orch.run_cash_sweep,
-        trigger=CronTrigger(hour=20, minute=50, timezone="Europe/Warsaw"),
+        trigger=CronTrigger(hour=21, minute=45, timezone="Europe/Warsaw"),
         id="cash_sweep",
         name="Daily cash sweep (idle cash → BIL)",
         misfire_grace_time=3600,
     )
-    logger.info("scheduler_cash_sweep_added", cron="50 20 * * *")
+    logger.info("scheduler_cash_sweep_added", cron="45 21 * * *")
 
     # Weekly self-critique reflection (Sunday 19:00 — before weekly trading cycles)
     scheduler.add_job(

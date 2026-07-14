@@ -13,11 +13,19 @@ requires VIX to stay calm for several sessions.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 import structlog
 
 logger = structlog.get_logger()
+
+# Last successfully computed regime, persisted so a Yahoo outage during a
+# crash doesn't silently hand regime classification back to the LLM.
+STATE_FILE = Path("data/regime_state.json")
+STALE_MAX_HOURS = 24.0
 
 # Entry triggers for HIGH_VOLATILITY (any one is enough)
 VIX_ENTER_LEVEL = 25.0        # absolute VIX close
@@ -40,6 +48,11 @@ class RegimeResult:
     spy: float
     spy_sma50: float | None
     spy_sma200: float | None
+    # True when loaded from the persisted state file after a data outage.
+    # Stale regimes still steer the prompts, but must NOT drive the exposure
+    # floor — mechanically buying into a possibly-crashing market on
+    # yesterday's BULL label is the one failure mode worse than no floor.
+    stale: bool = False
 
     def to_prompt_text(self) -> str:
         return (
@@ -51,6 +64,54 @@ class RegimeResult:
             "Large single-stock moves in the screener data do NOT change the market "
             "regime — screeners select outliers by construction.\n"
         )
+
+
+def save_regime_state(result: RegimeResult, path: Path = STATE_FILE) -> None:
+    """Persist the last successfully computed regime (best-effort)."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({
+            "regime": result.regime,
+            "reasoning": result.reasoning,
+            "vix": result.vix,
+            "spy": result.spy,
+            "spy_sma50": result.spy_sma50,
+            "spy_sma200": result.spy_sma200,
+            "computed_at": datetime.now().isoformat(),
+        }))
+    except Exception as e:
+        logger.warning("regime_state_save_failed", error=str(e))
+
+
+def load_regime_state(
+    path: Path = STATE_FILE,
+    max_age_hours: float = STALE_MAX_HOURS,
+) -> RegimeResult | None:
+    """Load the persisted regime if it is younger than max_age_hours.
+
+    Returns a RegimeResult with stale=True, or None if missing/too old/corrupt.
+    """
+    try:
+        data = json.loads(path.read_text())
+        computed_at = datetime.fromisoformat(data["computed_at"])
+        age_h = (datetime.now() - computed_at).total_seconds() / 3600
+        if age_h > max_age_hours:
+            logger.warning("regime_state_too_old", age_hours=round(age_h, 1))
+            return None
+        return RegimeResult(
+            regime=data["regime"],
+            reasoning=f"{data['reasoning']} [stale: computed {age_h:.1f}h ago, live data unavailable]",
+            vix=float(data["vix"]),
+            spy=float(data["spy"]),
+            spy_sma50=data.get("spy_sma50"),
+            spy_sma200=data.get("spy_sma200"),
+            stale=True,
+        )
+    except FileNotFoundError:
+        return None
+    except Exception as e:
+        logger.warning("regime_state_load_failed", error=str(e))
+        return None
 
 
 def _sma(closes: list[float], window: int) -> float | None:
