@@ -325,10 +325,13 @@ def get_portfolio_state(
 
         # Collect oversell deficits first — a fully-closed symbol is skipped
         # below, and those are exactly the ones carrying phantom shorts.
+        # Synthetic GF_ symbols are excluded: credit structures legitimately
+        # book their opening SELL before any BUY, so "oversold" is their normal
+        # lifecycle, not a ledger fault.
         oversold = {
             sym: round(data["oversold"], 6)
             for sym, data in agg.items()
-            if data.get("oversold", 0) > 1e-6
+            if data.get("oversold", 0) > 1e-6 and not sym.startswith("GF_")
         }
         if oversold:
             logger.warning(
@@ -367,7 +370,9 @@ def get_portfolio_state(
                 first_buy_date=data.get("first_buy"),
                 price_stale=price_stale,
             )
-            if price_stale:
+            if price_stale and not sym.startswith("GF_"):
+                # GF_ synthetics have no market quote by design — their marks
+                # live in options_positions, not in Ghostfolio prices.
                 logger.warning(
                     "position_price_missing",
                     account=account_name,

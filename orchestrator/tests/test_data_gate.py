@@ -211,6 +211,32 @@ class TestOptionCosts:
         # full premium 1.50 × 2 × 100 = $300, minus $1.30 opening commission
         assert realized == pytest.approx(298.70)
 
+    def test_get_legs_roundtrip(self, tmp_path):
+        """sqlite3.Row has no .get(): the old get_legs raised on every call,
+        was swallowed, and silently degraded condors to 2-leg pricing."""
+        tracker = OptionsPositionTracker(db_path=tmp_path / "audit.db")
+        pid = tracker.open_position(
+            account_key="t", symbol="SPY", spread_type="IRON_CONDOR", contracts=1,
+            expiration_date="2026-12-18", buy_strike=480.0, buy_option_type="put",
+            buy_premium=1.0, sell_strike=490.0, sell_option_type="put",
+            sell_premium=2.0, max_profit=200.0, max_loss=800.0, entry_debit=-2.00,
+        )
+        tracker.save_legs(pid, [
+            {"option_type": "put", "side": "buy", "strike": 480.0,
+             "premium": 1.0, "contract_symbol": "SPY261218P480"},
+            {"option_type": "put", "side": "sell", "strike": 490.0,
+             "premium": 2.0, "contract_symbol": "SPY261218P490"},
+            {"option_type": "call", "side": "sell", "strike": 520.0,
+             "premium": 2.0, "contract_symbol": "SPY261218C520"},
+            {"option_type": "call", "side": "buy", "strike": 530.0,
+             "premium": 1.0, "contract_symbol": "SPY261218C530"},
+        ])
+        legs = tracker.get_legs(pid)
+        assert len(legs) == 4
+        assert [l.side for l in legs] == ["buy", "sell", "sell", "buy"]
+        assert legs[1].premium == pytest.approx(2.0)
+        assert legs[2].contract_symbol == "SPY261218C520"
+
     def test_costs_default_zero_backcompat(self, tmp_path):
         tracker = OptionsPositionTracker(db_path=tmp_path / "audit.db")
         pid = tracker.open_position(

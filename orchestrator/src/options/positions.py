@@ -242,11 +242,16 @@ class OptionsPositionTracker:
                     "SELECT * FROM options_legs WHERE position_id=? ORDER BY leg_index",
                     (position_id,),
                 ).fetchall()
+            # sqlite3.Row has no .get() — the old code raised AttributeError on
+            # every call, was swallowed by the except below, and silently fell
+            # back to 2-leg pricing (wrong for iron condors and butterflies).
+            keys = {k for r in rows[:1] for k in r.keys()}
             return [
                 OptionLeg(
                     id=r["id"], position_id=r["position_id"], leg_index=r["leg_index"],
                     option_type=r["option_type"], side=r["side"], strike=r["strike"],
-                    premium=r.get("premium", 0) or 0, contract_symbol=r.get("contract_symbol", ""),
+                    premium=(r["premium"] if "premium" in keys else 0) or 0,
+                    contract_symbol=(r["contract_symbol"] if "contract_symbol" in keys else "") or "",
                 )
                 for r in rows
             ]
