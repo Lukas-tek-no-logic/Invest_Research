@@ -320,7 +320,7 @@ accounts:
 
   moonshot:
     name: "Moonshot"
-    ghostfolio_account_id: "TBD"   # created automatically on first run
+    ghostfolio_account_id: "cb2318cb-d829-409d-97f5-9a508faee0e3"
     model: "QWEN3.5"
     fallback_model: "Nemotron"
     broker_cost_model: "ibkr"
