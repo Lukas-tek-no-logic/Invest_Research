@@ -91,7 +91,9 @@ db.close()
 print()
 print("=== SALDA KONT (Ghostfolio) ===")
 try:
-    with open("/opt/invest-orchestrator/orchestrator/data/config.yaml") as f:
+    # Git-tracked config — the one the scheduler reads. orchestrator/data/config.yaml
+    # is an untracked orphan the dashboard writes; it does not know newer accounts.
+    with open("/opt/invest-orchestrator/config.yaml") as f:
         config = yaml.safe_load(f)
 
     gf = GhostfolioClient()
