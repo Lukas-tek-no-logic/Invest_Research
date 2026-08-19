@@ -190,6 +190,7 @@ def build_pass2_messages(
     max_trades = risk_profile.get("max_trades_per_cycle", 5)
     max_position_pct = risk_profile.get("max_position_pct", 20)
     min_cash_pct = risk_profile.get("min_cash_pct", 10)
+    min_order_usd = float(risk_profile.get("min_order_usd", 0) or 0)
     stop_loss_pct = risk_profile.get("stop_loss_pct", -15)
     watchlist = strategy_config.get("watchlist", [])
 
@@ -206,7 +207,11 @@ def build_pass2_messages(
         f"(= ${max_position_usd:,.0f} at current portfolio value).\n"
         f"  Before each BUY: existing_position_value + amount_usd MUST NOT exceed ${max_position_usd:,.0f}.\n"
         f"- Keep minimum {min_cash_pct}% cash reserve\n"
-        f"- Trade any symbol from the market data provided — you are NOT limited to a fixed list.\n"
+        + (f"- Minimum order size ${min_order_usd:,.0f}. Smaller orders are rejected: a $1 broker fee\n"
+           f"  on a ${min_order_usd:,.0f} order is already {100.0 / min_order_usd:.2f}% of it, so anything\n"
+           f"  smaller cannot break even. Prefer fewer, larger positions over many small ones.\n"
+           if min_order_usd > 0 else "")
+        + f"- Trade any symbol from the market data provided — you are NOT limited to a fixed list.\n"
         f"  Current universe: {', '.join(watchlist)}\n"
         "- You MUST justify every action with a specific thesis\n"
         "- If no good opportunities exist, it's OK to HOLD (empty actions list)\n\n"
@@ -493,6 +498,7 @@ def build_bull_bear_messages(
     max_trades = risk_profile.get("max_trades_per_cycle", 5)
     max_position_pct = risk_profile.get("max_position_pct", 20)
     min_cash_pct = risk_profile.get("min_cash_pct", 10)
+    min_order_usd = float(risk_profile.get("min_order_usd", 0) or 0)
     max_position_usd = portfolio.total_value * max_position_pct / 100
     buying_power = max(0, portfolio.available_cash - portfolio.total_value * min_cash_pct / 100)
 
@@ -518,8 +524,9 @@ def build_bull_bear_messages(
         f"Investment horizon: {horizon}\n\n"
         f"{bias}\n\n"
         f"Constraints: max {max_trades} trades, max {max_position_pct}% per position "
-        f"(=${max_position_usd:,.0f}), min {min_cash_pct}% cash reserve.\n"
-        f"Buying power: ${buying_power:,.2f}\n\n"
+        f"(=${max_position_usd:,.0f}), min {min_cash_pct}% cash reserve"
+        + (f", min ${min_order_usd:,.0f} per order.\n" if min_order_usd > 0 else ".\n")
+        + f"Buying power: ${buying_power:,.2f}\n\n"
         "IMPORTANT: ONLY reference data explicitly provided. Do NOT fabricate indicators.\n\n"
         "Respond with JSON:\n"
         "{\n"
@@ -574,6 +581,7 @@ def build_synthesis_messages(
     max_trades = risk_profile.get("max_trades_per_cycle", 5)
     max_position_pct = risk_profile.get("max_position_pct", 20)
     min_cash_pct = risk_profile.get("min_cash_pct", 10)
+    min_order_usd = float(risk_profile.get("min_order_usd", 0) or 0)
     stop_loss_pct = risk_profile.get("stop_loss_pct", -15)
     max_position_usd = portfolio.total_value * max_position_pct / 100
 

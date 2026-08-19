@@ -38,6 +38,11 @@ class Position:
     sector: str
     first_buy_date: str | None = None
     weight_pct: float = 0.0
+    # True when Ghostfolio had no market price and the valuation fell back to
+    # avg_cost.  Such a position reports P/L 0.0% by construction, so every
+    # P/L-driven rule (stop-loss, guardian) is blind to it — callers must skip
+    # those rules rather than act on the fabricated 0%.
+    price_stale: bool = False
 
 
 @dataclass
@@ -54,6 +59,15 @@ class PortfolioState:
     timestamp: str = ""
     # T-bill parking positions (BIL/SGOV) — excluded from `positions`, treated as cash
     cash_equivalents: list[Position] = field(default_factory=list)
+    # symbol → share count sold beyond what the account held.  Ghostfolio keeps
+    # the phantom short; the ledger clamps it to zero so it stays invisible to
+    # every rule.  Surfaced here so cycles can log and refuse to compound it.
+    oversold: dict[str, float] = field(default_factory=dict)
+    # Return since inception: (cash + securities) vs the account's starting
+    # budget.  Distinct from `total_pl_pct`, which measures only currently-held
+    # lots and therefore drops realised P/L on every full exit.
+    initial_budget: float | None = None
+    total_return_pct: float | None = None
 
     @property
     def cash_equivalent_value(self) -> float:
@@ -80,6 +94,26 @@ class PortfolioState:
                 return p
         return None
 
+    def get_holding(self, symbol: str) -> Position | None:
+        """Look up a symbol across investment positions AND T-bill parking.
+
+        `get_position` deliberately hides BIL/SGOV so the LLM never sees them as
+        holdings.  Anything that needs the true share count — above all clamping
+        a SELL to what the account actually owns — must use this instead, or the
+        sweep-out of parked cash looks like a zero-share position.
+        """
+        for p in self.positions:
+            if p.symbol == symbol:
+                return p
+        for p in self.cash_equivalents:
+            if p.symbol == symbol:
+                return p
+        return None
+
+    def holdings_map(self) -> dict[str, float]:
+        """symbol → owned share count, including T-bill parking."""
+        return {p.symbol: p.quantity for p in (*self.positions, *self.cash_equivalents)}
+
     def with_extra_cash(self, extra: float) -> "PortfolioState":
         """Return a copy with extra cash (e.g. from pending sells)."""
         return PortfolioState(
@@ -94,6 +128,9 @@ class PortfolioState:
             sector_weights=self.sector_weights,
             timestamp=self.timestamp,
             cash_equivalents=self.cash_equivalents,
+            oversold=self.oversold,
+            initial_budget=self.initial_budget,
+            total_return_pct=self.total_return_pct,
         )
 
     def to_prompt_text(self) -> str:
@@ -103,18 +140,29 @@ class PortfolioState:
             f"Total Value: ${self.total_value:,.2f}",
             f"Cash: ${self.available_cash:,.2f} ({self.cash_pct:.1f}%)",
             f"Invested: ${self.invested:,.2f}",
-            f"Total P/L: ${self.total_pl:,.2f} ({self.total_pl_pct:+.2f}%)",
+            f"Open-position P/L: ${self.total_pl:,.2f} ({self.total_pl_pct:+.2f}%)",
+        ]
+        # Return since inception is the only figure that survives full exits.
+        # Without it the model reads "+0.00%" on an account that is down 12%.
+        if self.total_return_pct is not None and self.initial_budget:
+            lines.append(
+                f"TOTAL RETURN since inception: {self.total_return_pct:+.2f}% "
+                f"(${self.total_value:,.2f} vs ${self.initial_budget:,.2f} start) "
+                f"— this includes realised results from closed trades"
+            )
+        lines += [
             f"Positions: {self.position_count}",
             "",
         ]
         if self.positions:
             lines.append("Holdings:")
             for p in sorted(self.positions, key=lambda x: x.market_value, reverse=True):
+                stale = "  [!] NO MARKET PRICE — P/L unknown" if p.price_stale else ""
                 lines.append(
                     f"  {p.symbol}: {p.quantity:.4f} shares @ avg ${p.avg_cost:.2f} "
                     f"| now ${p.current_price:.2f} | value ${p.market_value:,.2f} "
                     f"| P/L {p.unrealized_pl_pct:+.1f}% | weight {p.weight_pct:.1f}% "
-                    f"| sector: {p.sector}"
+                    f"| sector: {p.sector}{stale}"
                 )
         else:
             lines.append("Holdings: (none - cash only)")
@@ -132,6 +180,7 @@ def get_portfolio_state(
     client: GhostfolioClient,
     account_id: str,
     account_name: str,
+    initial_budget: float | None = None,
 ) -> PortfolioState:
     """Build a PortfolioState from Ghostfolio API data.
 
@@ -227,9 +276,13 @@ def get_portfolio_state(
             orders = []
 
         acct_orders = [o for o in orders if isinstance(o, dict) and o.get("accountId") == account_id]
+        # Replaying a ledger demands chronological order: Ghostfolio does not
+        # promise one, and a SELL seen before its BUY is silently dropped (qty is
+        # still 0, so the reduction is lost and the cost basis stays untouched).
+        acct_orders.sort(key=lambda o: str(o.get("date", "")))
 
         # Aggregate BUY / SELL per symbol
-        agg: dict[str, dict] = {}  # symbol → {qty, total_cost, first_date}
+        agg: dict[str, dict] = {}  # symbol → {qty, total_cost, first_buy, oversold}
         for order in acct_orders:
             sp = order.get("SymbolProfile") or {}
             sym = sp.get("symbol") or order.get("symbol", "")
@@ -241,22 +294,49 @@ def get_portfolio_state(
             order_date = str(order.get("date", ""))[:10]
 
             if sym not in agg:
-                agg[sym] = {"qty": 0.0, "total_cost": 0.0, "first_date": order_date}
+                agg[sym] = {"qty": 0.0, "total_cost": 0.0, "first_buy": None, "oversold": 0.0}
             if order_type == "BUY":
                 agg[sym]["qty"] += qty
                 agg[sym]["total_cost"] += qty * price
+                # Holding period runs from the FIRST buy, not from whichever
+                # order Ghostfolio happened to list first.
+                if agg[sym]["first_buy"] is None or order_date < agg[sym]["first_buy"]:
+                    agg[sym]["first_buy"] = order_date
             elif order_type == "SELL":
                 # Reduce qty; proportionally reduce cost basis
                 if agg[sym]["qty"] > 0:
                     sell_fraction = min(qty / agg[sym]["qty"], 1.0)
                     agg[sym]["total_cost"] *= (1 - sell_fraction)
-                agg[sym]["qty"] = max(0, agg[sym]["qty"] - qty)
+                remaining = agg[sym]["qty"] - qty
+                if remaining < 0:
+                    # Sold more than the account held.  Clamping to zero here is
+                    # what let this deficit accumulate unseen across round-trips:
+                    # the next BUY starts from 0 and the next full exit oversells
+                    # again.  Keep the clamp (a negative "position" would break
+                    # every downstream rule) but record the shortfall.
+                    agg[sym]["oversold"] += -remaining
+                agg[sym]["qty"] = max(0.0, remaining)
 
         positions: list[Position] = []
         cash_equivalents: list[Position] = []
         total_market = 0.0
         total_invested = 0.0
         sector_totals: dict[str, float] = {}
+
+        # Collect oversell deficits first — a fully-closed symbol is skipped
+        # below, and those are exactly the ones carrying phantom shorts.
+        oversold = {
+            sym: round(data["oversold"], 6)
+            for sym, data in agg.items()
+            if data.get("oversold", 0) > 1e-6
+        }
+        if oversold:
+            logger.warning(
+                "phantom_short_detected",
+                account=account_name,
+                symbols=oversold,
+                note="Ghostfolio holds SELLs beyond owned quantity; cash was credited for shares never held",
+            )
 
         for sym, data in agg.items():
             qty = data["qty"]
@@ -265,7 +345,9 @@ def get_portfolio_state(
 
             avg_cost = data["total_cost"] / qty if qty > 0 else 0.0
             info = price_map.get(sym, {})
-            current_price = info.get("price", 0.0) or avg_cost  # fallback to cost
+            quoted_price = float(info.get("price", 0.0) or 0.0)
+            price_stale = quoted_price <= 0
+            current_price = quoted_price or avg_cost  # fallback to cost
             market_value = current_price * qty
             investment = avg_cost * qty
             unrealized_pl = market_value - investment
@@ -282,8 +364,16 @@ def get_portfolio_state(
                 unrealized_pl=unrealized_pl,
                 unrealized_pl_pct=unrealized_pl_pct,
                 sector=sector,
-                first_buy_date=data.get("first_date"),
+                first_buy_date=data.get("first_buy"),
+                price_stale=price_stale,
             )
+            if price_stale:
+                logger.warning(
+                    "position_price_missing",
+                    account=account_name,
+                    symbol=sym,
+                    note="valued at avg_cost; P/L reads 0% so stop-loss cannot fire",
+                )
             total_market += market_value
             if sym in CASH_EQUIVALENT_SYMBOLS:
                 # T-bill parking: counts toward total value but is not an
@@ -319,6 +409,14 @@ def get_portfolio_state(
         total_pl = equity_market - total_invested
         total_pl_pct = (total_pl / total_invested * 100) if total_invested > 0 else 0.0
 
+        # Return since inception. `total_pl_pct` above only sees lots still held,
+        # so a rotating account reports ~0% no matter how much it has lost.
+        total_return_pct = (
+            (total_value / initial_budget - 1) * 100
+            if initial_budget and initial_budget > 0
+            else None
+        )
+
         state = PortfolioState(
             account_id=account_id,
             account_name=account_name,
@@ -331,6 +429,9 @@ def get_portfolio_state(
             sector_weights=sector_weights,
             timestamp=datetime.utcnow().isoformat(),
             cash_equivalents=cash_equivalents,
+            oversold=oversold,
+            initial_budget=initial_budget,
+            total_return_pct=total_return_pct,
         )
 
         logger.info(
@@ -339,6 +440,8 @@ def get_portfolio_state(
             total_value=total_value,
             positions=len(positions),
             cash=cash,
+            total_return_pct=(round(total_return_pct, 2) if total_return_pct is not None else None),
+            oversold_symbols=len(oversold),
         )
         return state
 

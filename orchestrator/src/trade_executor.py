@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -46,8 +48,17 @@ class TradeExecutor:
         self,
         actions: list[TradeAction],
         account_id: str,
+        holdings: dict[str, float] | None = None,
     ) -> list[TradeResult]:
         """Execute a list of trade actions.
+
+        Args:
+            actions: Approved trade actions.
+            account_id: Ghostfolio account to book them against.
+            holdings: symbol → owned share count, used to clamp SELLs to what the
+                account actually holds.  Build it from
+                ``PortfolioState.holdings_map()`` so T-bill parking is included.
+                ``None`` disables clamping.
 
         Returns list of TradeResult with success/failure for each.
         """
@@ -64,11 +75,16 @@ class TradeExecutor:
 
         results = []
         for action in deduped:
-            result = self._execute_single(action, account_id)
+            result = self._execute_single(action, account_id, holdings)
             results.append(result)
         return results
 
-    def _execute_single(self, action: TradeAction, account_id: str) -> TradeResult:
+    def _execute_single(
+        self,
+        action: TradeAction,
+        account_id: str,
+        holdings: dict[str, float] | None = None,
+    ) -> TradeResult:
         """Execute a single trade action."""
         try:
             # Get current price
@@ -80,8 +96,35 @@ class TradeExecutor:
                     error=f"Could not get price for {action.symbol}",
                 )
 
-            # Calculate quantity
+            # Calculate quantity.  NOTE: `amount_usd` was sized against
+            # Ghostfolio's marketPrice while `price` comes from yfinance — two
+            # different feeds, so the implied share count drifts systematically.
+            # On a SELL that drift becomes a phantom short.
             quantity = action.amount_usd / price
+
+            if action.type == "SELL" and holdings is not None:
+                held = float(holdings.get(action.symbol, 0.0))
+                if held <= 0:
+                    return TradeResult(
+                        action=action,
+                        success=False,
+                        error=f"Refusing to sell {action.symbol}: account holds no shares",
+                    )
+                if quantity > held:
+                    logger.warning(
+                        "sell_quantity_clamped",
+                        symbol=action.symbol,
+                        requested=round(quantity, 6),
+                        held=round(held, 6),
+                        amount_usd=round(action.amount_usd, 2),
+                        exec_price=price,
+                        note="price-feed drift would have oversold; clamped to owned quantity",
+                    )
+                    quantity = held
+
+            # Truncate rather than round: rounding up can push the order above the
+            # owned quantity and recreate the very short we just clamped away.
+            quantity = math.floor(quantity * 1_000_000) / 1_000_000
             if quantity <= 0:
                 return TradeResult(
                     action=action,

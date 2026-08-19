@@ -144,6 +144,13 @@ class Orchestrator:
     def _clear_retries(self, cycle_name: str, account_key: str) -> None:
         self._retry_attempts.pop(f"retry_{cycle_name}_{account_key}", None)
 
+    def _initial_budget(self, acct: dict) -> float:
+        """Account's starting capital (account override > defaults > 10000)."""
+        return float(acct.get(
+            "initial_budget",
+            self.config.get("defaults", {}).get("initial_budget", 10000),
+        ))
+
     def _pass2_samples(self, acct: dict) -> int:
         """Self-consistency sample count for Pass 2 (account > defaults > 1)."""
         default = self.config.get("defaults", {}).get("pass2_samples", 1)
@@ -226,7 +233,10 @@ class Orchestrator:
             min_cash_pct = acct.get("risk_profile", {}).get("min_cash_pct", 10)
 
             try:
-                portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+                portfolio = get_portfolio_state(
+                    self.ghostfolio, account_id, account_name,
+                    initial_budget=self._initial_budget(acct),
+                )
             except ValuationUnavailable as e:
                 logger.warning("cash_sweep_skipped", account=account_name, error=str(e))
                 continue
@@ -248,7 +258,9 @@ class Orchestrator:
                 self.ghostfolio, self.market_data, dry_run=self.dry_run,
                 broker_cost_model=acct.get("broker_cost_model", ""),
             )
-            results = executor.execute_trades([action], account_id)
+            results = executor.execute_trades(
+                [action], account_id, holdings=portfolio.holdings_map(),
+            )
             ok = any(r.success for r in results)
             logger.info(
                 "cash_sweep_done" if ok else "cash_sweep_failed",
@@ -294,7 +306,10 @@ class Orchestrator:
             risk_profile = acct.get("risk_profile", {})
 
             try:
-                portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+                portfolio = get_portfolio_state(
+                    self.ghostfolio, account_id, account_name,
+                    initial_budget=self._initial_budget(acct),
+                )
             except ValuationUnavailable as e:
                 logger.warning("guardian_skipped", account=account_name, error=str(e))
                 continue
@@ -312,7 +327,9 @@ class Orchestrator:
                 self.ghostfolio, self.market_data, dry_run=self.dry_run,
                 broker_cost_model=acct.get("broker_cost_model", ""),
             )
-            results = executor.execute_trades(forced, account_id)
+            results = executor.execute_trades(
+                forced, account_id, holdings=portfolio.holdings_map(),
+            )
 
             executed_trades = []
             fees_paid = 0.0
@@ -636,7 +653,10 @@ class Orchestrator:
 
         try:
             # ===== STEP 1: LIGHT CONTEXT =====
-            portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            portfolio = get_portfolio_state(
+                self.ghostfolio, account_id, account_name,
+                initial_budget=self._initial_budget(acct),
+            )
             portfolio_before = {
                 "total_value": portfolio.total_value,
                 "cash": portfolio.cash,
@@ -827,11 +847,10 @@ class Orchestrator:
             for w in risk_result.warnings:
                 logger.warning("intraday_risk_warning", account=account_name, warning=w)
 
-            # --- Cost-breakeven filter (intraday-only) ---
+            # --- Cost-breakeven filter (discretionary actions only) ---
             if cost_model:
-                all_candidates = risk_result.forced_actions + risk_result.approved_actions
                 approved_cost, cost_filtered = filter_by_cost_breakeven(
-                    all_candidates, portfolio, cost_model, cost_breakeven_mult,
+                    risk_result.approved_actions, portfolio, cost_model, cost_breakeven_mult,
                 )
                 for f in cost_filtered:
                     logger.info(
@@ -842,7 +861,8 @@ class Orchestrator:
                     risk_result.modifications.append(
                         f"COST-FILTERED {f['action'].type} {f['action'].symbol}: {f['reason']}"
                     )
-                all_actions = approved_cost
+                risk_result.approved_actions = approved_cost
+                all_actions = risk_result.forced_actions + approved_cost
             else:
                 all_actions = risk_result.forced_actions + risk_result.approved_actions
 
@@ -861,7 +881,9 @@ class Orchestrator:
                     dry_run=self.dry_run,
                     broker_cost_model=cost_model,
                 )
-                results = executor.execute_trades(all_actions, account_id)
+                results = executor.execute_trades(
+                    all_actions, account_id, holdings=portfolio.holdings_map(),
+                )
 
                 cash_delta = 0.0
                 new_symbols = {p.symbol for p in portfolio.positions}
@@ -1048,7 +1070,10 @@ class Orchestrator:
             # ===== PHASE 1: GATHER CONTEXT =====
             logger.info("phase1_gathering_context", account=account_name)
 
-            portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            portfolio = get_portfolio_state(
+                self.ghostfolio, account_id, account_name,
+                initial_budget=self._initial_budget(acct),
+            )
             portfolio_before = {
                 "total_value": portfolio.total_value,
                 "cash": portfolio.cash,
@@ -1397,10 +1422,13 @@ class Orchestrator:
                 logger.info("risk_modification", account=account_name, mod=m)
 
             # ===== PHASE 5: TRADE EXECUTION =====
-            all_candidates = risk_result.forced_actions + risk_result.approved_actions
+            # Cost filter applies ONLY to discretionary actions. Forced ones
+            # (stop-loss, drawdown reduction, zombie cleanup, floor top-up) must
+            # never be priced out: a position too small to sell profitably still
+            # has to be closable, or it is stranded until it hits zero.
             if cost_model:
-                all_actions, cost_filtered = filter_by_cost_breakeven(
-                    all_candidates, portfolio, cost_model, cost_breakeven_mult,
+                approved_cost, cost_filtered = filter_by_cost_breakeven(
+                    risk_result.approved_actions, portfolio, cost_model, cost_breakeven_mult,
                 )
                 for f in cost_filtered:
                     logger.info(
@@ -1411,8 +1439,12 @@ class Orchestrator:
                     risk_result.modifications.append(
                         f"COST-FILTERED {f['action'].type} {f['action'].symbol}: {f['reason']}"
                     )
+                # Drop them from approved_actions too, so the audit log and the
+                # reflection loop do not report trades that never executed.
+                risk_result.approved_actions = approved_cost
+                all_actions = risk_result.forced_actions + approved_cost
             else:
-                all_actions = all_candidates
+                all_actions = risk_result.forced_actions + risk_result.approved_actions
             executed_trades = []
 
             # Lazy sweep-out: fund approved buys from T-bill parking when the
@@ -1449,7 +1481,9 @@ class Orchestrator:
                     self.ghostfolio, self.market_data, dry_run=self.dry_run,
                     broker_cost_model=cost_model,
                 )
-                results = executor.execute_trades(all_actions, account_id)
+                results = executor.execute_trades(
+                    all_actions, account_id, holdings=portfolio.holdings_map(),
+                )
 
                 fees_paid = 0.0
                 for r in results:
@@ -1640,7 +1674,10 @@ class Orchestrator:
             # ===== PHASE 1: GATHER CONTEXT =====
             logger.info("spreads_phase1_context", account=account_name)
 
-            portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            portfolio = get_portfolio_state(
+                self.ghostfolio, account_id, account_name,
+                initial_budget=self._initial_budget(acct),
+            )
             portfolio_before = {
                 "total_value": portfolio.total_value,
                 "cash": portfolio.cash,
@@ -1895,7 +1932,10 @@ class Orchestrator:
             # a valuation outage at this point must NOT fail the cycle (that would
             # schedule a retry and double-execute); fall back to the pre-state.
             try:
-                portfolio_after_state = get_portfolio_state(self.ghostfolio, account_id, account_name)
+                portfolio_after_state = get_portfolio_state(
+                    self.ghostfolio, account_id, account_name,
+                    initial_budget=self._initial_budget(acct),
+                )
             except ValuationUnavailable:
                 logger.warning("post_execution_valuation_unavailable", account=account_name)
                 portfolio_after_state = portfolio
@@ -1991,7 +2031,10 @@ class Orchestrator:
             # ===== PHASE 1: GATHER CONTEXT =====
             logger.info("options_phase1_context", account=account_name)
 
-            portfolio = get_portfolio_state(self.ghostfolio, account_id, account_name)
+            portfolio = get_portfolio_state(
+                self.ghostfolio, account_id, account_name,
+                initial_budget=self._initial_budget(acct),
+            )
             portfolio_before = {
                 "total_value": portfolio.total_value,
                 "cash": portfolio.cash,
@@ -2274,7 +2317,10 @@ class Orchestrator:
             # a valuation outage at this point must NOT fail the cycle (that would
             # schedule a retry and double-execute); fall back to the pre-state.
             try:
-                portfolio_after_state = get_portfolio_state(self.ghostfolio, account_id, account_name)
+                portfolio_after_state = get_portfolio_state(
+                    self.ghostfolio, account_id, account_name,
+                    initial_budget=self._initial_budget(acct),
+                )
             except ValuationUnavailable:
                 logger.warning("post_execution_valuation_unavailable", account=account_name)
                 portfolio_after_state = portfolio

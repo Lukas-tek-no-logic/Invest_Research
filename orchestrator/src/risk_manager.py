@@ -23,7 +23,10 @@ MAX_PORTFOLIO_DRAWDOWN_PCT = -20.0
 # defensiveness left 40-100% of capital idle through a bull market. Enforced
 # like any other hard limit; HIGH_VOLATILITY/BEAR_TREND have no floor.
 EXPOSURE_FLOOR_PCT = {"BULL_TREND": 60.0, "SIDEWAYS": 40.0}
-FLOOR_TOPUP_MIN_USD = 50.0
+# Aligned with the cost-breakeven floor: under the ibkr model a $1 fee is 0.5%
+# of $200, so a smaller mechanical top-up would spend more on commission than a
+# discretionary buy is allowed to.
+FLOOR_TOPUP_MIN_USD = 200.0
 
 # Pairs of highly correlated assets (buying both in same cycle is redundant)
 CORRELATED_PAIRS = [
@@ -116,6 +119,23 @@ class RiskManager:
             symbols = [a.symbol for a in forced_sells]
             result.warnings.append(f"STOP-LOSS triggered for: {', '.join(symbols)}")
 
+        # A position valued at avg_cost reports exactly 0.0% P/L, so the
+        # stop-loss above cannot see it however far it has actually fallen.
+        stale = [p.symbol for p in portfolio.positions if p.price_stale]
+        if stale:
+            result.warnings.append(
+                f"NO MARKET PRICE for {', '.join(stale)} — valued at cost, P/L unknown, "
+                f"stop-loss cannot evaluate these positions"
+            )
+
+        # Phantom shorts mean Ghostfolio booked sells the account could not cover.
+        if portfolio.oversold:
+            detail = ", ".join(f"{s} {q:+.4f}" for s, q in portfolio.oversold.items())
+            result.warnings.append(
+                f"PHANTOM SHORT in Ghostfolio: {detail} — cash was credited for shares "
+                f"never held; buying power and total value are overstated"
+            )
+
         # 2. Check portfolio drawdown
         if portfolio.total_pl_pct <= MAX_PORTFOLIO_DRAWDOWN_PCT:
             result.warnings.append(
@@ -124,6 +144,25 @@ class RiskManager:
             )
             forced_reduce = self._force_reduce_exposure(portfolio, 0.5)
             result.forced_actions.extend(forced_reduce)
+
+        # Deduplicate forced sells. Zombie cleanup, stop-loss and drawdown
+        # reduction are independent streams that can all target one symbol; the
+        # executor dedupes by (type, symbol) and runs only the first, but the
+        # accounting below would otherwise count every duplicate toward
+        # `freed_cash` and validate buys against money that never arrives.
+        # Worst case is a -20% drawdown, where every position appears twice.
+        deduped_forced: list[TradeAction] = []
+        seen_forced: set[tuple[str, str]] = set()
+        for action in result.forced_actions:
+            key = (action.type, action.symbol)
+            if key in seen_forced:
+                result.modifications.append(
+                    f"DEDUPED forced {action.type} {action.symbol}: already queued by an earlier rule"
+                )
+                continue
+            seen_forced.add(key)
+            deduped_forced.append(action)
+        result.forced_actions = deduped_forced
 
         # Bootstrap mode: if mostly cash, allow more trades to deploy capital faster
         effective_max_trades = self.max_trades_per_cycle
@@ -491,65 +530,98 @@ class RiskManager:
         return forced
 
 
+FULL_EXIT_FRACTION = 0.99
+
+
 def filter_by_cost_breakeven(
     actions: list[TradeAction],
     portfolio: PortfolioState,
     cost_model: str,
     multiplier: float = 2.0,
 ) -> tuple[list[TradeAction], list[dict]]:
-    """Filter out actions where transaction cost is too high to break even.
+    """Reject trades too small to justify their broker fee.
 
-    For each action, computes the broker fee and rejects those where the fee
-    exceeds ``1 / multiplier`` percent of the trade amount.  With the default
-    ``multiplier=2.0`` this means: reject if fee > 0.5% of trade value.
+    A trade is rejected when the fee exceeds ``1 / multiplier`` percent of the
+    trade value — with the default ``multiplier=2.0``, when the fee is more than
+    0.5% of the amount.  Under the ``ibkr`` model (a flat $1 at these sizes) that
+    puts the effective floor at $200 per order.
 
-    This standalone function is called only from ``run_intraday_cycle`` so
-    it does not affect the standard weekly/daily cycle flow.
+    Pass ONLY discretionary actions here.  Mechanical ones — stop-loss, drawdown
+    reduction, zombie cleanup, exposure-floor top-ups — must bypass the filter
+    entirely, because a position too small to sell profitably is still a position
+    that has to be closable; blocking its exit strands it until it reaches zero.
+    Callers therefore filter ``approved_actions`` and re-attach
+    ``forced_actions`` afterwards.
+
+    Full exits are exempt for the same reason: once the decision to leave a
+    position is made, the fee is unavoidable and the alternative is holding
+    forever.
 
     Args:
-        actions: List of trade actions to filter.
+        actions: Discretionary trade actions to filter.
         portfolio: Current portfolio state (used to look up current prices).
         cost_model: Broker identifier passed to ``calculate_cost``.
-        multiplier: Minimum required gain-to-cost ratio.  A multiplier of 2
-            means the trade must be able to earn at least 2× the fee to be
-            worthwhile.
+        multiplier: Inverse of the tolerated fee percentage.  Higher is stricter:
+            2.0 → 0.5%, 4.0 → 0.25%.
 
     Returns:
         Tuple ``(approved, filtered_out)`` where ``filtered_out`` is a list of
         dicts ``{action, reason, fee}``.
     """
-    # Break-even threshold: reject if fee_pct > threshold
-    # e.g. multiplier=2 → reject if fee > 0.5% of trade amount
-    threshold_pct = 100.0 / multiplier  # percent
+    # Reject when fee_pct exceeds this. multiplier=2 → 0.5% of trade value.
+    threshold_pct = 1.0 / multiplier if multiplier > 0 else 0.5
 
     approved: list[TradeAction] = []
     filtered_out: list[dict] = []
 
     for action in actions:
-        # Zombie cleanup actions bypass cost filter — closing dead weight is always worth the fee
-        if action.amount_usd < 5.0 and action.type == "SELL" and "ZOMBIE" in action.thesis.upper():
+        thesis = (action.thesis or "").upper()
+
+        # Mechanical actions are never priced out of existence.
+        if any(tag in thesis for tag in ("ZOMBIE", "STOP-LOSS", "FORCED REDUCTION", "EXPOSURE FLOOR")):
             approved.append(action)
             continue
 
-        # Estimate price: prefer live portfolio price, fall back to rough calc
-        pos = portfolio.get_position(action.symbol)
-        price = pos.current_price if pos else 0.0
-        if price <= 0 and action.amount_usd > 0:
-            price = action.amount_usd / 10  # rough fallback
+        holding = portfolio.get_holding(action.symbol)
 
-        quantity = action.amount_usd / price if price > 0 else 0.0
+        # A SELL that closes (almost) the whole position is an exit, not a
+        # discretionary trim — let it through regardless of fee.
+        if (
+            action.type == "SELL"
+            and holding is not None
+            and holding.market_value > 0
+            and action.amount_usd >= holding.market_value * FULL_EXIT_FRACTION
+        ):
+            approved.append(action)
+            continue
+
+        price = holding.current_price if holding else 0.0
+        if price <= 0:
+            # No trustworthy price. Fail OPEN rather than fabricate one — a
+            # made-up price here silently rejects legitimate trades.
+            logger.info(
+                "cost_breakeven_skipped_no_price",
+                symbol=action.symbol,
+                note="no market price available; cost filter not applied",
+            )
+            approved.append(action)
+            continue
+
+        quantity = action.amount_usd / price
         fee = calculate_cost(cost_model, quantity, price)
         fee_pct = (fee / action.amount_usd * 100) if action.amount_usd > 0 else 0.0
 
-        if fee_pct * multiplier > threshold_pct:
+        if fee_pct > threshold_pct:
             reason = (
-                f"Fee ${fee:.2f} ({fee_pct:.2f}%) × {multiplier} "
-                f"exceeds {threshold_pct:.1f}% breakeven threshold"
+                f"Fee ${fee:.2f} is {fee_pct:.2f}% of ${action.amount_usd:,.0f} "
+                f"— above the {threshold_pct:.2f}% limit "
+                f"(min viable order ≈ ${fee / (threshold_pct / 100):,.0f})"
             )
             filtered_out.append({"action": action, "reason": reason, "fee": fee})
             logger.info(
                 "cost_breakeven_filtered",
                 symbol=action.symbol,
+                amount_usd=round(action.amount_usd, 2),
                 fee=round(fee, 4),
                 fee_pct=round(fee_pct, 3),
                 threshold_pct=threshold_pct,
