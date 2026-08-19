@@ -119,7 +119,7 @@ try:
                 """SELECT COALESCE(SUM(realized_pl), 0), COUNT(*)
                    FROM options_positions
                    WHERE account_key = ? AND status != 'open'
-                     AND entry_date >= '2026-07-09'""",
+                     AND entry_date >= '2026-08-19'""",
                 (key,),
             ).fetchone()
             adb.close()

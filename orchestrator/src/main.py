@@ -299,6 +299,11 @@ class Orchestrator:
                 continue
             if self._is_options_account(acct) or acct.get("cycle_type") == "research":
                 continue
+            if acct.get("risk_profile", {}).get("moonshot_mode"):
+                # Moonshot sleeve: no price-based exits, ever — the daily
+                # guardian's stop-losses would eject every future multibagger
+                # at its first -50% drawdown.
+                continue
             account_id = acct.get("ghostfolio_account_id", "")
             if not account_id:
                 continue

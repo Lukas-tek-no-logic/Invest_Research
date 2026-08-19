@@ -74,6 +74,12 @@ class RiskManager:
         self.min_order_usd = risk_profile.get("min_order_usd", 0)
         self.max_sector_exposure_pct = risk_profile.get("max_sector_exposure_pct", 40)
         self.exposure_floor_pct = risk_profile.get("exposure_floor_pct", EXPOSURE_FLOOR_PCT)
+        # Moonshot mode: multi-year lottery-ticket sleeve. Deep drawdowns are
+        # the expected cost of holding for the right tail, so every mechanical
+        # price-based exit (stop-loss, drawdown reduction, zombie cleanup) and
+        # the regime exposure floor are disabled. Exits are thesis-break only,
+        # decided by the model; position caps and trade limits stay in force.
+        self.moonshot_mode = bool(risk_profile.get("moonshot_mode", False))
         self._sim_date = sim_date  # None = use datetime.now()
 
     def validate(
@@ -95,9 +101,13 @@ class RiskManager:
         """
         result = RiskManagerResult()
 
+        if self.moonshot_mode:
+            regime = None  # no exposure-floor top-ups on the moonshot sleeve
+
         # 0. Force-close zombie positions (< $5 value) — not worth the drag
         zombie_threshold = 5.0
-        for position in portfolio.positions:
+        zombie_candidates = [] if self.moonshot_mode else portfolio.positions
+        for position in zombie_candidates:
             if 0 < position.market_value < zombie_threshold:
                 result.forced_actions.append(TradeAction(
                     type="SELL",
@@ -137,7 +147,7 @@ class RiskManager:
             )
 
         # 2. Check portfolio drawdown
-        if portfolio.total_pl_pct <= MAX_PORTFOLIO_DRAWDOWN_PCT:
+        if not self.moonshot_mode and portfolio.total_pl_pct <= MAX_PORTFOLIO_DRAWDOWN_PCT:
             result.warnings.append(
                 f"CRITICAL: Portfolio drawdown {portfolio.total_pl_pct:.1f}% exceeds "
                 f"{MAX_PORTFOLIO_DRAWDOWN_PCT}% threshold. Forcing 50% exposure reduction."
@@ -499,6 +509,8 @@ class RiskManager:
     def _check_stop_losses(self, portfolio: PortfolioState) -> list[TradeAction]:
         """Check all positions for stop-loss triggers."""
         forced = []
+        if self.moonshot_mode or self.stop_loss_pct is None:
+            return forced
         for position in portfolio.positions:
             if position.price_stale:
                 # Valued at avg_cost -> P/L reads exactly 0.0%, so the comparison

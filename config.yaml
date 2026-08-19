@@ -317,3 +317,39 @@ accounts:
       target_dte_max: 45
     # No hardcoded watchlist — uses research agent's dynamic picks
     watchlist: []
+
+  moonshot:
+    name: "Moonshot"
+    ghostfolio_account_id: "TBD"   # created automatically on first run
+    model: "QWEN3.5"
+    fallback_model: "Nemotron"
+    broker_cost_model: "ibkr"
+    cron: "30 18 5 * *"   # monthly thesis review, 5th @ 18:30 CET (NYSE mid-session)
+    decision_mode: "llm"
+    strategy: "moonshot"
+    strategy_description: >-
+      Moonshot: a concentrated 8-12 equal-weight lottery-ticket portfolio of
+      potential multi-year multibaggers, bought after drawdowns or capitulation.
+      Held for YEARS. Most picks are expected to lose; the whole portfolio is
+      carried by the right tail. NEVER sell because the price fell - drawdowns
+      of -50% or worse are EXPECTED and are not a reason to act. Sell ONLY when
+      the thesis breaks: product failure, destructive dilution, management
+      exodus, fraud, or a structurally lost market.
+    prompt_style: >-
+      Think like a venture investor operating in public markets. Look for
+      capitulation bottoms in companies with intact products and balance
+      sheets, insider buying after crashes, hated-but-growing businesses, and
+      pre-inflection technology. At most one NEW position per cycle. Add to an
+      existing position only on thesis confirmation, never to average down a
+      broken thesis. Doing nothing is the correct action in most cycles.
+    preferred_metrics: ["Revenue growth", "Insider activity", "Cash runway", "Product inflection"]
+    horizon: "3-10 years"
+    risk_profile:
+      max_position_pct: 15         # 8-12 equal tickets
+      min_cash_pct: 0
+      max_trades_per_cycle: 2
+      min_order_usd: 250
+      min_holding_days: 30         # damps churn; thesis-break sells possible after
+      moonshot_mode: true          # disables stop-loss, drawdown brake, zombie cleanup, exposure floor, daily guardian
+      max_sector_exposure_pct: 100 # concentration is the point of this sleeve
+    watchlist: []                  # research agent picks + LLM suggestions

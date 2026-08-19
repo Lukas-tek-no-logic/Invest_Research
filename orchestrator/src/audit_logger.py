@@ -158,10 +158,13 @@ class AuditLogger:
         self,
         account_key: str,
         limit: int = 10,
-        since: str = "2026-07-09",
+        since: str = "2026-08-19",
     ) -> list[dict]:
         """Recent closed trades for an account (post-baseline only — older
-        history has known-corrupt P/L and must not feed the model)."""
+        history has known-corrupt P/L and must not feed the model).
+
+        Baseline 2026-08-19: hard account reset after the data-gate deploy;
+        earlier journal rows carry fee-less P/L and pre-reset positions."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
