@@ -285,16 +285,22 @@ def _fetch(symbol: str) -> FundamentalSnapshot:
 
 
 def _fetch_earnings_history(ticker: yf.Ticker) -> list[EarningsQuarter]:
-    """Extract last 2-4 quarterly earnings beat/miss records."""
+    """Extract last 2-4 quarterly earnings beat/miss records.
+
+    Uses `Ticker.earnings_history` (columns epsActual/epsEstimate/surprisePercent).
+    The old `Ticker.quarterly_earnings` was removed from yfinance 0.2.x — every
+    call raised, was swallowed at debug level, and the beat/miss signal silently
+    vanished from all prompts.
+    """
     quarters: list[EarningsQuarter] = []
     try:
-        qe = paced_call(lambda: ticker.quarterly_earnings, label="qe")  # DataFrame: index=date, cols=[Actual, Estimate]
+        qe = paced_call(lambda: ticker.earnings_history, label="qe")
         if qe is None or qe.empty:
             return quarters
-        # Newest first
-        for period, row in qe.iloc[:4].iterrows():
-            actual = row.get("Actual") if hasattr(row, "get") else row["Actual"]
-            estimate = row.get("Estimate") if hasattr(row, "get") else row["Estimate"]
+        # earnings_history is oldest-first; we want newest first
+        for period, row in qe.iloc[::-1].iloc[:4].iterrows():
+            actual = row.get("epsActual")
+            estimate = row.get("epsEstimate")
             try:
                 actual = float(actual)
                 estimate = float(estimate)
@@ -314,7 +320,8 @@ def _fetch_earnings_history(ticker: yf.Ticker) -> list[EarningsQuarter]:
                 beat=actual >= estimate,
             ))
     except Exception as e:
-        logger.debug("earnings_history_failed", error=str(e))
+        # warning, not debug — the last API removal was invisible for months
+        logger.warning("earnings_history_failed", error=str(e))
     return quarters
 
 

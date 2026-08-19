@@ -32,6 +32,9 @@ class LLMClient:
             timeout=DEFAULT_TIMEOUT,
         )
         self._http = httpx.Client(timeout=30.0)
+        # Model that produced the last successful chat_json answer (fallbacks
+        # included) — the audit log records this next to the configured model.
+        self.last_model_used: str | None = None
 
     def list_models(self) -> list[str]:
         """Get available models from llama-swap."""
@@ -104,7 +107,15 @@ class LLMClient:
                     temperature=temperature,
                     max_tokens=max_tokens,
                 )
-                return self._extract_json(raw)
+                result = self._extract_json(raw)
+                # Record which model actually answered — the silent fallback
+                # otherwise corrupts every per-model comparison downstream.
+                self.last_model_used = current_model
+                if current_model != model:
+                    logger.warning(
+                        "llm_fallback_used", requested=model, used=current_model,
+                    )
+                return result
             except (json.JSONDecodeError, ValueError) as e:
                 last_error = e
                 logger.warning(

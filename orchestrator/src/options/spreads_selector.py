@@ -372,7 +372,7 @@ def _select_iron_condor(
         legs.append(SelectedLeg(
             option_type=opt_type,
             strike=float(row["strike"]),
-            premium=_mid_price(row),
+            premium=_mid_price(row, side),
             iv=iv,
             delta=delta,
             contract_symbol=str(row.get("contractSymbol", "") or ""),
@@ -458,7 +458,7 @@ def _select_butterfly(
         legs.append(SelectedLeg(
             option_type="call",
             strike=float(row["strike"]),
-            premium=_mid_price(row),
+            premium=_mid_price(row, side),
             iv=iv,
             delta=delta,
             contract_symbol=str(row.get("contractSymbol", "") or ""),
@@ -510,8 +510,8 @@ def _build_two_leg_spread(
     """Build a two-leg vertical spread from selected rows."""
     buy_strike = float(buy_row["strike"])
     sell_strike = float(sell_row["strike"])
-    buy_premium = _mid_price(buy_row)
-    sell_premium = _mid_price(sell_row)
+    buy_premium = _mid_price(buy_row, "buy")
+    sell_premium = _mid_price(sell_row, "sell")
 
     buy_iv = float(buy_row.get("impliedVolatility", 0.25) or 0.25)
     sell_iv = float(sell_row.get("impliedVolatility", 0.25) or 0.25)
@@ -606,11 +606,30 @@ def _find_delta_row(
     return best_row
 
 
-def _mid_price(row: pd.Series) -> float:
-    """Return bid/ask midpoint, falling back to lastPrice."""
+HAIRCUT_FRACTION = 0.25  # of the half-spread; 1% of lastPrice when no bid/ask
+
+
+def _mid_price(row: pd.Series, side: str | None = None) -> float:
+    """Return bid/ask midpoint with an execution haircut.
+
+    side="sell": fill below mid (premium received is lower than mid);
+    side="buy":  fill above mid. side=None: raw mid (marking, not fills).
+    Booking fills at raw mid overstated every credit by half the spread —
+    on a 4-leg condor, four times over.
+    """
     bid = float(row.get("bid", 0) or 0)
     ask = float(row.get("ask", 0) or 0)
     if bid > 0 and ask > 0:
-        return round((bid + ask) / 2, 2)
+        mid = (bid + ask) / 2
+        half = (ask - bid) / 2
+        if side == "sell":
+            mid -= HAIRCUT_FRACTION * half
+        elif side == "buy":
+            mid += HAIRCUT_FRACTION * half
+        return round(mid, 2)
     last = float(row.get("lastPrice", 0) or 0)
+    if side == "sell":
+        last *= 0.99
+    elif side == "buy":
+        last *= 1.01
     return round(last, 2)

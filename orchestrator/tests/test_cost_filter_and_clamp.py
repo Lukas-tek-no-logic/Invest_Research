@@ -322,10 +322,13 @@ class TestMinOrderUsd:
         from src.decision_parser import DecisionResult
         profile = {"max_position_pct": 50, "min_cash_pct": 10,
                    "max_trades_per_cycle": 5, "min_order_usd": 400}
+        from tests.test_data_gate import make_quote
         portfolio = make_portfolio([], cash=5000.0)
+        # A quote must be present: without one the no-quote gate rejects the
+        # BUY before the min-order check is ever reached.
         result = RiskManager(profile).validate(
             decision=DecisionResult(actions=[buy("AAPL", 100.0)]),
-            portfolio=portfolio, quotes={},
+            portfolio=portfolio, quotes={"AAPL": make_quote("AAPL")},
         )
         assert result.approved_actions == []
         assert any("too small" in r.rejection_reason.lower() for r in result.rejected_actions)

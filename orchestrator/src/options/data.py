@@ -193,8 +193,14 @@ def get_current_option_price(
     option_type: str,   # "call" or "put"
     strike: float,
     expiration: str,    # YYYY-MM-DD
+    side: str | None = None,  # "buy"/"sell" = execution price with haircut; None = raw mid
 ) -> float | None:
-    """Fetch mid-price (bid+ask)/2 for a specific option contract."""
+    """Fetch mid-price (bid+ask)/2 for a specific option contract.
+
+    With side given, apply the same execution haircut as the selectors
+    (25% of the half-spread; 1% of lastPrice when no bid/ask): buying back
+    a short fills above mid, selling a long fills below it.
+    """
     try:
         ticker = yf.Ticker(symbol)
         chain = paced_call(lambda: ticker.option_chain(expiration), label=f"opt-chain:{symbol}")
@@ -205,8 +211,19 @@ def get_current_option_price(
         bid = float(row["bid"].iloc[0])
         ask = float(row["ask"].iloc[0])
         if bid <= 0 and ask <= 0:
-            return float(row["lastPrice"].iloc[0])
-        return round((bid + ask) / 2, 2)
+            last = float(row["lastPrice"].iloc[0])
+            if side == "buy":
+                last *= 1.01
+            elif side == "sell":
+                last *= 0.99
+            return round(last, 2)
+        mid = (bid + ask) / 2
+        half = (ask - bid) / 2
+        if side == "buy":
+            mid += 0.25 * half
+        elif side == "sell":
+            mid -= 0.25 * half
+        return round(mid, 2)
     except Exception as e:
         logger.error("option_price_fetch_failed", symbol=symbol, strike=strike, error=str(e))
         return None

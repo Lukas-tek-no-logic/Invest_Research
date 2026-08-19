@@ -77,7 +77,8 @@ class WatchlistManager:
         for s in self.core:
             _add(s)
 
-        for s in self._fetch_screener(max_screener_per_source):
+        screener_syms = self._fetch_screener(max_screener_per_source)
+        for s in screener_syms:
             _add(s)
 
         for s in self._load_suggestions():
@@ -99,6 +100,7 @@ class WatchlistManager:
             "watchlist_built",
             account=self.account_key,
             core=len(self.core),
+            screener=len(screener_syms),
             total=len(result),
         )
         return result
@@ -137,10 +139,12 @@ class WatchlistManager:
                     sym = (q.get("symbol") or "").upper().strip()
                     if not sym or sym in symbols or sym in _EXCLUDE_SYMBOLS:
                         continue
-                    # Quality gate: no sub-$10 or micro-cap spike names
+                    # Quality gate: no sub-$10 or micro-cap spike names.
+                    # Missing market cap FAILS the gate — the old `mcap and`
+                    # short-circuit let every cap-less quote bypass the $2B floor.
                     price = q.get("regularMarketPrice") or 0
                     mcap = q.get("marketCap") or 0
-                    if price < MIN_SCREENER_PRICE or (mcap and mcap < MIN_SCREENER_MARKET_CAP):
+                    if price < MIN_SCREENER_PRICE or mcap < MIN_SCREENER_MARKET_CAP:
                         continue
                     symbols.append(sym)
                     added += 1
@@ -148,7 +152,9 @@ class WatchlistManager:
                         break
                 logger.debug("screener_ok", screen=screen, found=added)
             except Exception as e:
-                logger.debug("screener_failed", screen=screen, error=str(e))
+                # warning, not debug — a silently empty screener looks
+                # identical to a normal run in the logs
+                logger.warning("screener_failed", screen=screen, error=str(e))
 
         # Remove core symbols (they're already present at the front)
         return [s for s in symbols if s not in self.core]

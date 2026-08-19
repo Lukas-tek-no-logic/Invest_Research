@@ -31,6 +31,7 @@ import structlog
 
 from ..ghostfolio_client import GhostfolioClient
 from ..market_data import MarketDataProvider
+from ..transaction_costs import calculate_option_cost
 from .data import get_current_option_price
 from .positions import OptionsPosition, OptionsPositionTracker
 # Import from deployed module names.
@@ -75,6 +76,7 @@ class OptionsExecutor:
         risk_profile: dict,
         dry_run: bool = False,
         account_key: str | None = None,
+        broker_cost_model: str = "",
     ):
         self.ghostfolio = ghostfolio
         self.market_data = market_data
@@ -83,6 +85,10 @@ class OptionsExecutor:
         self.account_key = account_key or account_id
         self.risk_profile = risk_profile
         self.dry_run = dry_run
+        self.broker_cost_model = broker_cost_model
+
+    def _commission(self, contracts: int, legs: int = 1) -> float:
+        return calculate_option_cost(self.broker_cost_model, contracts, legs)
 
     # ── Public interface (called by main.py) ──────────────────────────────────
 
@@ -395,12 +401,13 @@ class OptionsExecutor:
     def _close_position(self, pos: OptionsPosition, reason: str) -> OptionsTradeResult:
         """Buy back an existing CSP or CC position."""
         try:
-            # Current mid-price of the sold option
+            # Buy-back price of the sold option (mid + haircut: we cross the spread)
             close_value = get_current_option_price(
                 pos.symbol,
                 pos.sell_option_type,
                 pos.sell_strike,
                 pos.expiration_date,
+                side="buy",
             )
             if close_value is None:
                 # Fall back to recorded current value or entry premium
@@ -421,6 +428,7 @@ class OptionsExecutor:
 
             realized_pl = self.tracker.close_position(
                 pos.id, close_value, reason, ghostfolio_order_id,
+                costs=self._commission(pos.contracts) * 2,  # open + buy-back
             )
 
             logger.info(
@@ -474,7 +482,7 @@ class OptionsExecutor:
                             # symbol at $0 — otherwise the GF_WHEEL SELL stays open
                             # forever as a phantom short holding in Ghostfolio.
                             self._ghostfolio_assignment(pos, cost_basis)
-                            self._ghostfolio_close(pos, 0.0)
+                            self._ghostfolio_close(pos, 0.0, fee=0.0)  # assignment/exercise is free
                         return OptionsTradeResult(
                             action="ASSIGNMENT", symbol=pos.symbol,
                             spread_type=pos.spread_type,
@@ -496,7 +504,7 @@ class OptionsExecutor:
                         if not self.dry_run:
                             # Record stock sale AND settle the synthetic option symbol
                             self._ghostfolio_call_away(pos)
-                            self._ghostfolio_close(pos, 0.0)
+                            self._ghostfolio_close(pos, 0.0, fee=0.0)  # assignment/exercise is free
                         return OptionsTradeResult(
                             action="CALLED_AWAY", symbol=pos.symbol,
                             spread_type=pos.spread_type,
@@ -508,8 +516,9 @@ class OptionsExecutor:
                 # in Ghostfolio or it stays open forever as a phantom holding.
                 logger.info("wheel_position_expired", pos_id=pos.id, symbol=pos.symbol)
                 if not self.dry_run:
-                    self._ghostfolio_close(pos, 0.0)
-                self.tracker.expire_position(pos.id)
+                    self._ghostfolio_close(pos, 0.0, fee=0.0)  # expiry itself is free
+                # Only the opening commission.
+                self.tracker.expire_position(pos.id, costs=self._commission(pos.contracts))
                 return OptionsTradeResult(
                     action="UPDATE", symbol=pos.symbol,
                     spread_type=pos.spread_type,
@@ -577,6 +586,7 @@ class OptionsExecutor:
                 quantity=float(contracts),
                 unit_price=round(csp.premium * 100, 2),
                 data_source="MANUAL",
+                fee=self._commission(contracts),
             )
             return result.get("id") if isinstance(result, dict) else None
         except Exception as e:
@@ -599,6 +609,7 @@ class OptionsExecutor:
                 quantity=float(contracts),
                 unit_price=round(cc.premium * 100, 2),
                 data_source="MANUAL",
+                fee=self._commission(contracts),
             )
             return result.get("id") if isinstance(result, dict) else None
         except Exception as e:
@@ -662,7 +673,9 @@ class OptionsExecutor:
             logger.error("ghostfolio_call_away_failed", symbol=pos.symbol, error=str(e))
             return None
 
-    def _ghostfolio_close(self, pos: OptionsPosition, close_value: float) -> str | None:
+    def _ghostfolio_close(
+        self, pos: OptionsPosition, close_value: float, fee: float | None = None,
+    ) -> str | None:
         """Record position close (buy-back) as a BUY in Ghostfolio.
 
         Buying back a short option = paying cash → BUY so Ghostfolio balance decreases.
@@ -684,6 +697,7 @@ class OptionsExecutor:
                 quantity=float(pos.contracts),
                 unit_price=round(close_value * 100, 2),
                 data_source="MANUAL",
+                fee=self._commission(pos.contracts) if fee is None else fee,
             )
             return result.get("id") if isinstance(result, dict) else None
         except Exception as e:

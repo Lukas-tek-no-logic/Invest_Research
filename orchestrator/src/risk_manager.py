@@ -338,6 +338,16 @@ class RiskManager:
         check = RiskCheckResult(action=action, original_amount=action.amount_usd)
         quote = quotes.get(action.symbol)
 
+        # Rule: no BUY without a live quote. A missing quote previously skipped the
+        # penny-stock and liquidity rules entirely — fail closed instead.
+        # SELLs pass through so exits are never stranded by a data outage.
+        if action.type == "BUY" and (quote is None or quote.price <= 0):
+            check.approved = False
+            check.rejection_reason = (
+                f"No market quote for {action.symbol} — cannot verify price or liquidity"
+            )
+            return check
+
         # Rule: No penny stocks
         if quote and quote.price < MIN_PRICE:
             check.approved = False
@@ -490,6 +500,15 @@ class RiskManager:
         """Check all positions for stop-loss triggers."""
         forced = []
         for position in portfolio.positions:
+            if position.price_stale:
+                # Valued at avg_cost -> P/L reads exactly 0.0%, so the comparison
+                # below would be against a fabricated number. Skip loudly.
+                logger.warning(
+                    "stop_loss_skipped_stale_price",
+                    symbol=position.symbol,
+                    quantity=position.quantity,
+                )
+                continue
             if position.unrealized_pl_pct <= self.stop_loss_pct:
                 forced.append(TradeAction(
                     type="SELL",

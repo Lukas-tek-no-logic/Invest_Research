@@ -353,6 +353,7 @@ class Orchestrator:
                             exit_price=r.unit_price,
                             entry_date=pos.first_buy_date,
                             thesis=r.action.thesis,
+                            fees=r.fee,
                         )
 
             # Sync canonical cash after real sells (same policy as run_cycle)
@@ -463,6 +464,7 @@ class Orchestrator:
                         risk_profile=risk_profile,
                         dry_run=self.dry_run,
                         account_key=key,
+                        broker_cost_model=acct.get("broker_cost_model", ""),
                     )
                 else:
                     executor = OptionsExecutor(
@@ -473,6 +475,7 @@ class Orchestrator:
                         risk_profile=risk_profile,
                         dry_run=self.dry_run,
                         account_key=key,
+                        broker_cost_model=acct.get("broker_cost_model", ""),
                     )
 
                 update_results = executor.update_active_positions(active)
@@ -502,7 +505,9 @@ class Orchestrator:
 
                 for pos in active:
                     try:
-                        spot = self.market_data.get_current_price(pos.symbol)
+                        # `or None`: a failed ETF lookup returns 0, and spot=0
+                        # read as "price collapsed" — forcing spurious closes.
+                        spot = self.market_data.get_current_price(pos.symbol) or None
                     except Exception:
                         spot = None
                     forced = check_exit(pos, spot=spot)
@@ -609,6 +614,7 @@ class Orchestrator:
           5. Trade execution with broker fees
           6. Audit logging (includes fees_paid)
         """
+        self.llm.last_model_used = None  # per-cycle; audit reads it after Pass 2
         self._load_config()
         acct = self.config.get("accounts", {}).get(account_key)
         if not acct:
@@ -836,6 +842,14 @@ class Orchestrator:
             if decision.suggest_symbols:
                 watchlist_mgr.save_suggestions(decision.suggest_symbols)
 
+            # Actions may name symbols outside the pre-fetched watchlist quotes.
+            # Fetch those now — without a quote a BUY is rejected (fail closed).
+            missing_syms = [
+                a.symbol for a in decision.actions if a.symbol not in quotes
+            ]
+            if missing_syms:
+                quotes.update(self.market_data.get_quotes_batch(missing_syms))
+
             # --- Risk validation ---
             risk_mgr = RiskManager(risk_profile)
             risk_result = risk_mgr.validate(
@@ -993,6 +1007,8 @@ class Orchestrator:
             portfolio_before=portfolio_before,
             portfolio_after=portfolio_after,
             error=error_msg,
+            model_used=self.llm.last_model_used,
+            benchmark_return_pct=self._get_spy_return_30d(),
         )
 
         status = "ERROR" if error_msg else "OK"
@@ -1027,6 +1043,7 @@ class Orchestrator:
           5. Trade execution
           6. Audit logging
         """
+        self.llm.last_model_used = None  # per-cycle; audit reads it after Pass 2
         self._load_config()  # Reload in case config changed
         acct = self.config.get("accounts", {}).get(account_key)
         if not acct:
@@ -1100,7 +1117,7 @@ class Orchestrator:
             tech_signals = {}
             for sym in watchlist:
                 try:
-                    df = self.market_data.get_history(sym, period="6mo")
+                    df = self.market_data.get_history(sym, period="2y")  # SMA200 needs >=200 rows; 6mo gave ~126 and it was always None
                     if not df.empty:
                         tech_signals[sym] = compute_indicators(df, sym)
                 except Exception as e:
@@ -1401,6 +1418,14 @@ class Orchestrator:
             # ===== PHASE 4: RISK VALIDATION =====
             logger.info("phase4_risk_validation", account=account_name)
 
+            # Actions may name symbols outside the pre-fetched watchlist quotes.
+            # Fetch those now — without a quote a BUY is rejected (fail closed).
+            missing_syms = [
+                a.symbol for a in decision.actions if a.symbol not in quotes
+            ]
+            if missing_syms:
+                quotes.update(self.market_data.get_quotes_batch(missing_syms))
+
             risk_mgr = RiskManager(risk_profile)
             # A stale (file-fallback) regime steers the prompts but must not
             # drive the floor — no mechanical buying on yesterday's label.
@@ -1521,6 +1546,7 @@ class Orchestrator:
                                     exit_price=r.unit_price,
                                     entry_date=pos.first_buy_date,
                                     thesis=r.action.thesis,
+                                    fees=r.fee,
                                 )
                     else:
                         logger.error("trade_failed", symbol=r.action.symbol, error=r.error)
@@ -1625,6 +1651,8 @@ class Orchestrator:
             portfolio_after=portfolio_after,
             error=error_msg,
             fees_paid=fees_paid if executed_trades else 0.0,
+            model_used=self.llm.last_model_used,
+            benchmark_return_pct=self._get_spy_return_30d(),
         )
 
         status = "ERROR" if error_msg else "OK"
@@ -1644,6 +1672,7 @@ class Orchestrator:
           5. Execution (closes -> opens -> updates)
           6. Audit logging
         """
+        self.llm.last_model_used = None  # per-cycle; audit reads it after Pass 2
         self._load_config()
         acct = self.config.get("accounts", {}).get(account_key)
         if not acct:
@@ -1715,7 +1744,7 @@ class Orchestrator:
             tech_signals = {}
             for sym in watchlist:
                 try:
-                    df = self.market_data.get_history(sym, period="6mo")
+                    df = self.market_data.get_history(sym, period="2y")  # SMA200 needs >=200 rows; 6mo gave ~126 and it was always None
                     if not df.empty:
                         tech_signals[sym] = compute_indicators(df, sym)
                 except Exception as e:
@@ -1901,6 +1930,7 @@ class Orchestrator:
                 dry_run=self.dry_run,
                 account_key=account_key,
                 cash_available=portfolio.cash,
+                broker_cost_model=acct.get("broker_cost_model", ""),
             )
 
             all_closes = risk_result.forced_closes + risk_result.approved_closes
@@ -1983,6 +2013,8 @@ class Orchestrator:
             portfolio_before=portfolio_before,
             portfolio_after=portfolio_after,
             error=error_msg,
+            model_used=self.llm.last_model_used,
+            benchmark_return_pct=self._get_spy_return_30d(),
         )
 
         status = "ERROR" if error_msg else "OK"
@@ -2002,6 +2034,7 @@ class Orchestrator:
           5. Execution (closes → opens → updates)
           6. Audit logging
         """
+        self.llm.last_model_used = None  # per-cycle; audit reads it after Pass 2
         self._load_config()
         acct = self.config.get("accounts", {}).get(account_key)
         if not acct:
@@ -2101,7 +2134,7 @@ class Orchestrator:
             tech_signals = {}
             for sym in watchlist:
                 try:
-                    df = self.market_data.get_history(sym, period="6mo")
+                    df = self.market_data.get_history(sym, period="2y")  # SMA200 needs >=200 rows; 6mo gave ~126 and it was always None
                     if not df.empty:
                         tech_signals[sym] = compute_indicators(df, sym)
                 except Exception as e:
@@ -2286,6 +2319,7 @@ class Orchestrator:
                 risk_profile=risk_profile,
                 dry_run=self.dry_run,
                 account_key=account_key,
+                broker_cost_model=acct.get("broker_cost_model", ""),
             )
 
             all_closes = risk_result.forced_closes + risk_result.approved_closes
@@ -2367,6 +2401,8 @@ class Orchestrator:
             portfolio_before=portfolio_before,
             portfolio_after=portfolio_after,
             error=error_msg,
+            model_used=self.llm.last_model_used,
+            benchmark_return_pct=self._get_spy_return_30d(),
         )
 
         status = "ERROR" if error_msg else "OK"

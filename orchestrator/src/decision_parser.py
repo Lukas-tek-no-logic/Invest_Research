@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import re
+
 from pydantic import BaseModel, Field, field_validator, model_validator
 import structlog
 
 logger = structlog.get_logger()
+
+# Same shape rule as watchlist_manager: 1-5 letters, optional class suffix (BRK-B).
+TICKER_RE = re.compile(r"^[A-Z]{1,5}(-[A-Z]{1,2})?$")
 
 
 # --- Pass 1: Analysis Models ---
@@ -157,6 +162,11 @@ class TradeAction(BaseModel):
             raise ValueError(f"Invalid trade type: {v}. Must be BUY or SELL.")
         return v_upper
 
+    @field_validator("symbol")
+    @classmethod
+    def validate_symbol(cls, v: str) -> str:
+        return v.upper().strip()
+
     @field_validator("urgency")
     @classmethod
     def validate_urgency(cls, v: str) -> str:
@@ -222,6 +232,11 @@ class DecisionResult(BaseModel):
                         a["amount_usd"] = a.pop("amount")
                     # Only keep if it has the minimum required fields
                     if a.get("type") and a.get("symbol") and a.get("amount_usd"):
+                        sym = str(a["symbol"]).upper().strip()
+                        if not TICKER_RE.match(sym):
+                            logger.warning("action_invalid_symbol", action=a)
+                            continue
+                        a["symbol"] = sym
                         cleaned.append(a)
                     else:
                         logger.warning("action_missing_fields", action=a)

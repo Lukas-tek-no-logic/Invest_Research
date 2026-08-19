@@ -131,7 +131,7 @@ accounts:
       cc_dte_min: 14
       cc_dte_max: 30
       take_profit_pct: 50
-      stop_loss_pct: 200     # 200% of premium = stop loss for shorts
+      stop_loss_pct: 150     # 150% of premium; at 200 the TP50/SL pair needed 80% win-rate to break even
       earnings_blackout_days: 5
       min_premium_yield_pct: 1.5  # min monthly yield = premium / (strike*100) * (30/dte) * 100 (~18%/yr)
     watchlist:               # liquid sub-$80 underlyings: strike*100 fits a $10K account
@@ -256,7 +256,7 @@ accounts:
       cc_dte_min: 14
       cc_dte_max: 30
       take_profit_pct: 50
-      stop_loss_pct: 200
+      stop_loss_pct: 150   # was 200; TP50/SL200 breakeven win-rate was 80%
       earnings_blackout_days: 5
       min_premium_yield_pct: 1.5  # min monthly yield = premium / (strike*100) * (30/dte) * 100 (~18%/yr)
     watchlist:               # liquid sub-$80 underlyings: strike*100 fits a $10K account

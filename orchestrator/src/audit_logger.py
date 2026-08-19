@@ -99,6 +99,18 @@ class AuditLogger:
                     created_at TEXT DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            # Migrations for pre-existing databases (CREATE TABLE IF NOT EXISTS
+            # never alters an existing schema).
+            self._ensure_column(conn, "decision_log", "model_used", "TEXT")
+            self._ensure_column(conn, "decision_log", "valuation_carried", "INTEGER DEFAULT 0")
+            self._ensure_column(conn, "decision_log", "benchmark_return_pct", "REAL")
+            self._ensure_column(conn, "trade_journal", "fees", "REAL DEFAULT 0")
+
+    @staticmethod
+    def _ensure_column(conn: sqlite3.Connection, table: str, column: str, decl: str) -> None:
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
     def log_closed_trade(
         self,
@@ -109,23 +121,30 @@ class AuditLogger:
         exit_price: float,
         entry_date: str | None,
         thesis: str = "",
+        fees: float = 0.0,
     ) -> None:
-        """Record a closed (sold) position's realized result for the feedback loop."""
-        realized_pl = (exit_price - entry_price) * quantity
+        """Record a closed (sold) position's realized result for the feedback loop.
+
+        `fees` is subtracted from the P/L. Without it a +0.5% win on a $215
+        trade landed in the journal as a win when it was a net loss — teaching
+        the model that frequent small trades work.
+        """
+        realized_pl = (exit_price - entry_price) * quantity - fees
+        cost_basis = entry_price * quantity
         realized_pl_pct = (
-            (exit_price / entry_price - 1) * 100 if entry_price > 0 else 0.0
+            realized_pl / cost_basis * 100 if cost_basis > 0 else 0.0
         )
         try:
             with sqlite3.connect(self.db_path) as conn:
                 conn.execute(
                     """INSERT INTO trade_journal
                        (account_key, symbol, quantity, entry_price, exit_price,
-                        realized_pl, realized_pl_pct, entry_date, close_date, thesis)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        realized_pl, realized_pl_pct, entry_date, close_date, thesis, fees)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         account_key, symbol, quantity, entry_price, exit_price,
                         realized_pl, realized_pl_pct, entry_date,
-                        datetime.now().strftime("%Y-%m-%d"), thesis[:300],
+                        datetime.now().strftime("%Y-%m-%d"), thesis[:300], fees,
                     ),
                 )
             logger.info(
@@ -188,6 +207,8 @@ class AuditLogger:
         portfolio_after: dict | None = None,
         error: str | None = None,
         fees_paid: float = 0.0,
+        model_used: str | None = None,
+        benchmark_return_pct: float | None = None,
     ) -> str:
         """Log a full decision cycle.
 
@@ -245,10 +266,12 @@ class AuditLogger:
         pv = p_after.get("total_value", p_before.get("total_value"))
         pl_pct = p_after.get("total_pl_pct", p_before.get("total_pl_pct"))
         cash_val = p_after.get("cash", p_before.get("cash"))
+        valuation_carried = 0
         if pv is None or pv <= 0:
             last_good = self._last_known_valuation(account_key)
             if last_good is not None:
                 pv, pl_pct, cash_val = last_good
+                valuation_carried = 1
                 logger.warning(
                     "audit_valuation_unavailable_carried_forward",
                     account=account_key, carried_value=pv,
@@ -261,8 +284,9 @@ class AuditLogger:
                     (timestamp, account_key, account_name, model, market_regime,
                      portfolio_outlook, confidence, actions_count, forced_actions_count,
                      rejected_count, portfolio_value, portfolio_pl_pct, cash,
-                     log_file, success, error)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                     log_file, success, error,
+                     model_used, valuation_carried, benchmark_return_pct)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         now.isoformat(),
                         account_key,
@@ -280,6 +304,9 @@ class AuditLogger:
                         str(log_file),
                         0 if error else 1,
                         error,
+                        model_used,
+                        valuation_carried,
+                        benchmark_return_pct,
                     ),
                 )
         except Exception as e:
@@ -302,6 +329,7 @@ class AuditLogger:
                     """SELECT portfolio_value, portfolio_pl_pct, cash FROM decision_log
                     WHERE account_key = ? AND portfolio_value IS NOT NULL
                       AND portfolio_value > 0
+                      AND COALESCE(valuation_carried, 0) = 0
                     ORDER BY timestamp DESC LIMIT 1""",
                     (account_key,),
                 ).fetchone()
@@ -322,7 +350,7 @@ class AuditLogger:
             with sqlite3.connect(self.db_path) as conn:
                 conn.row_factory = sqlite3.Row
                 rows = conn.execute(
-                    """SELECT timestamp, log_file FROM decision_log
+                    """SELECT timestamp, log_file, model FROM decision_log
                     WHERE account_key = ? AND success = 1
                     ORDER BY timestamp DESC LIMIT ?""",
                     (account_key, limit),
@@ -341,6 +369,9 @@ class AuditLogger:
                     if not isinstance(actions_raw, list):
                         actions_raw = []
                     trades = entry.get("executed_trades", [])
+                    forced_raw = entry.get("risk_manager", {}).get("forced_actions", [])
+                    if not isinstance(forced_raw, list):
+                        forced_raw = []
 
                     # Match results to actions
                     actions = []
@@ -361,12 +392,26 @@ class AuditLogger:
                                 break
                         actions.append(action_data)
 
+                    forced = [
+                        {
+                            "type": f.get("type"),
+                            "symbol": f.get("symbol"),
+                            "amount_usd": f.get("amount_usd", 0),
+                            "thesis": str(f.get("thesis", ""))[:80],
+                        }
+                        for f in forced_raw if isinstance(f, dict)
+                    ]
+
                     history.append({
                         "date": row["timestamp"][:10],
+                        # Guardian/risk-manager cycles previously rendered as the
+                        # model's own "HOLD" while positions were force-sold.
+                        "source": row["model"] if row["model"] == "guardian" else "llm",
                         "outlook": decision.get("portfolio_outlook", "Unknown"),
                         "confidence": decision.get("confidence", "N/A"),
                         "actions": actions,
-                        "hold_reason": decision.get("reasoning", "")[:100] if not actions else "",
+                        "forced_actions": forced,
+                        "hold_reason": decision.get("reasoning", "")[:100] if not (actions or forced) else "",
                     })
                 except (FileNotFoundError, json.JSONDecodeError, AttributeError, TypeError, KeyError):
                     continue

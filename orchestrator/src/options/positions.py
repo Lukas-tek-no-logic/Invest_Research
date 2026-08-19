@@ -277,8 +277,10 @@ class OptionsPositionTracker:
         close_value: float,
         reason: str,
         ghostfolio_order_id: str | None = None,
+        costs: float = 0.0,
     ) -> float:
-        """Mark position as closed. Returns realized P&L."""
+        """Mark position as closed. Returns realized P&L net of `costs`
+        (round-trip commissions in USD)."""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             row = conn.execute(
@@ -295,9 +297,9 @@ class OptionsPositionTracker:
             # entry_debit < 0 → credit trade (CSP, credit spread): P/L = premium_received - close_cost
             # entry_debit > 0 → debit trade (debit spread):        P/L = close_value - debit_paid
             if entry_debit < 0:
-                realized_pl = round((-entry_debit - close_value) * contracts * 100, 2)
+                realized_pl = round((-entry_debit - close_value) * contracts * 100 - costs, 2)
             else:
-                realized_pl = round((close_value - entry_debit) * contracts * 100, 2)
+                realized_pl = round((close_value - entry_debit) * contracts * 100 - costs, 2)
 
             conn.execute(
                 """UPDATE options_positions
@@ -320,8 +322,10 @@ class OptionsPositionTracker:
         )
         return realized_pl
 
-    def expire_position(self, position_id: int) -> None:
-        """Mark position as expired OTM (worthless — keep full premium)."""
+    def expire_position(self, position_id: int, costs: float = 0.0) -> None:
+        """Mark position as expired OTM (worthless — keep full premium).
+
+        `costs` = the opening commission; no closing order exists on expiry."""
         with sqlite3.connect(self.db_path) as conn:
             row = conn.execute(
                 "SELECT entry_debit, contracts, spread_type FROM options_positions WHERE id=?",
@@ -329,7 +333,7 @@ class OptionsPositionTracker:
             ).fetchone()
             if row:
                 entry_debit, contracts, spread_type = row
-                realized_pl = round(-entry_debit * contracts * 100, 2)
+                realized_pl = round(-entry_debit * contracts * 100 - costs, 2)
                 conn.execute(
                     """UPDATE options_positions
                     SET status='expired', close_date=?, close_value=0,

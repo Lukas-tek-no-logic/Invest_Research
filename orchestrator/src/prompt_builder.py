@@ -417,9 +417,13 @@ def format_decision_history(history: list[dict], max_entries: int = 4) -> str:
         date = entry.get("date", "Unknown")
         outlook = entry.get("outlook", "Unknown")
         confidence = entry.get("confidence", "N/A")
-        lines.append(f"\n[{date}] Outlook: {outlook}, Confidence: {confidence}")
+        if entry.get("source") == "guardian":
+            lines.append(f"\n[{date}] RISK GUARDIAN CYCLE (not your decision)")
+        else:
+            lines.append(f"\n[{date}] Outlook: {outlook}, Confidence: {confidence}")
 
         actions = entry.get("actions", [])
+        forced = entry.get("forced_actions", [])
         if actions:
             for action in actions:
                 result_str = ""
@@ -431,7 +435,16 @@ def format_decision_history(history: list[dict], max_entries: int = 4) -> str:
                     f"(thesis: \"{action.get('thesis', '')}\")"
                     f"{result_str}"
                 )
-        else:
+        if forced:
+            # Previously invisible: these cycles rendered as "HOLD (no trades)"
+            # while the risk manager was force-selling positions.
+            for action in forced:
+                lines.append(
+                    f"  FORCED BY RISK MGMT: {action.get('type', '?')} "
+                    f"{action.get('symbol', '?')} ${action.get('amount_usd', 0):,.0f} "
+                    f"({action.get('thesis', '')})"
+                )
+        if not actions and not forced:
             lines.append("  HOLD (no trades)")
             reason = entry.get("hold_reason", "")
             if reason:

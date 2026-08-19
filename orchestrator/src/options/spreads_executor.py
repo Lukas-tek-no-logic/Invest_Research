@@ -25,6 +25,7 @@ import structlog
 
 from ..ghostfolio_client import GhostfolioClient
 from ..market_data import MarketDataProvider
+from ..transaction_costs import calculate_option_cost
 from .data import get_current_option_price
 from .positions import OptionsPosition, OptionsPositionTracker
 from .spreads_decision_parser import SpreadAction
@@ -58,6 +59,7 @@ class SpreadsExecutor:
         dry_run: bool = False,
         account_key: str | None = None,
         cash_available: float | None = None,
+        broker_cost_model: str = "",
     ):
         self.ghostfolio = ghostfolio
         self.market_data = market_data
@@ -66,11 +68,19 @@ class SpreadsExecutor:
         self.account_key = account_key or account_id
         self.risk_profile = risk_profile
         self.dry_run = dry_run
+        self.broker_cost_model = broker_cost_model
         # Post-selection affordability budget: the risk manager pre-approves
         # opens with a crude width-based max-loss proxy; once the selector
         # returns the REAL max_loss we re-check it here. Decremented across
         # opens within one cycle. None = check disabled.
         self._cash_available = cash_available
+
+    def _commission(self, contracts: int, legs: int) -> float:
+        return calculate_option_cost(self.broker_cost_model, contracts, max(legs, 1))
+
+    def _leg_count(self, pos: OptionsPosition) -> int:
+        legs = self.tracker.get_legs(pos.id)
+        return len(legs) if legs else 2
 
     # -- Public interface --
 
@@ -293,8 +303,11 @@ class SpreadsExecutor:
                 net_value = 0.0
                 all_priced = True
                 for leg in all_legs:
+                    # Closing inverts the side: a leg we sold is bought back
+                    # (fill above mid), a leg we bought is sold (fill below mid).
                     leg_price = get_current_option_price(
                         pos.symbol, leg.option_type, leg.strike, pos.expiration_date,
+                        side="buy" if leg.side == "sell" else "sell",
                     )
                     if leg_price is None:
                         all_priced = False
@@ -307,6 +320,7 @@ class SpreadsExecutor:
                 # negate to the signed convention used by multi-leg pricing)
                 leg_price = get_current_option_price(
                     pos.symbol, pos.sell_option_type, pos.sell_strike, pos.expiration_date,
+                    side="buy",
                 )
                 close_value = -leg_price if leg_price is not None else None
             if close_value is None:
@@ -341,8 +355,10 @@ class SpreadsExecutor:
                     close_value=close_value, reason=reason,
                 )
 
+            legs_n = len(all_legs) if all_legs else 2
             realized_pl = self.tracker.close_position(
                 pos.id, close_value, reason, ghostfolio_order_id,
+                costs=self._commission(pos.contracts, legs_n) * 2,  # open + close
             )
 
             logger.info(
@@ -383,13 +399,18 @@ class SpreadsExecutor:
                 logger.info("spread_position_expired", pos_id=pos.id, symbol=pos.symbol)
                 # Record the expiry in Ghostfolio too, or the synthetic holding
                 # stays open forever and becomes a phantom position.
+                exp_legs = self.tracker.get_legs(pos.id)
                 if not self.dry_run:
-                    exp_legs = self.tracker.get_legs(pos.id)
                     self._ghostfolio_close(
                         pos, 0.0,
                         strikes=[l.strike for l in exp_legs] if exp_legs else None,
+                        fee=0.0,  # expiry itself is free
                     )
-                self.tracker.expire_position(pos.id)
+                # Only the opening commission.
+                self.tracker.expire_position(
+                    pos.id,
+                    costs=self._commission(pos.contracts, len(exp_legs) if exp_legs else 2),
+                )
                 return SpreadsTradeResult(
                     action="UPDATE", symbol=pos.symbol,
                     spread_type=pos.spread_type,
@@ -559,6 +580,7 @@ class SpreadsExecutor:
                 quantity=float(spread.contracts),
                 unit_price=round(raw_debit * 100, 2),
                 data_source="MANUAL",
+                fee=self._commission(spread.contracts, len(spread.legs)),
             )
             return result.get("id") if isinstance(result, dict) else None
         except Exception as e:
@@ -567,6 +589,7 @@ class SpreadsExecutor:
 
     def _ghostfolio_close(
         self, pos: OptionsPosition, close_value: float, strikes: list | None = None,
+        fee: float | None = None,
     ) -> str | None:
         """Record spread close in Ghostfolio.
 
@@ -586,6 +609,7 @@ class SpreadsExecutor:
                 quantity=float(pos.contracts),
                 unit_price=max(round(close_value * 100, 2), 0.01),
                 data_source="MANUAL",
+                fee=self._commission(pos.contracts, self._leg_count(pos)) if fee is None else fee,
             )
             return result.get("id") if isinstance(result, dict) else None
         except Exception as e:

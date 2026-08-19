@@ -37,3 +37,24 @@ def calculate_cost(broker: str, quantity: float, price: float) -> float:
 
     # Unknown broker — no simulated cost
     return 0.0
+
+
+def calculate_option_cost(broker: str, contracts: int, legs: int = 1) -> float:
+    """Calculate a commission for one options order (all legs of one structure).
+
+    Args:
+        broker: Broker identifier (case-insensitive).
+        contracts: Contracts per leg.
+        legs: Number of legs filled in the order (vertical = 2, condor = 4).
+
+    Returns:
+        Commission in USD. Returns 0.0 for unknown brokers.
+    """
+    broker = broker.lower().strip()
+
+    if broker == "ibkr":
+        # IBKR US options: $0.65 per contract, $1.00 minimum per order.
+        return max(1.00, 0.65 * contracts * legs)
+
+    # Unknown broker — no simulated cost
+    return 0.0

@@ -58,21 +58,30 @@ def build_scan_messages(
         "== 30-MIN PRICE DELTA ==",
     ]
 
+    data_gaps: list[str] = []
     for sym, data in market_data.items():
         if sym.startswith("^"):
             continue  # skip index symbols in the main table; handled separately below
         current_price = data.get("price", 0.0)
-        prev_price = last_cycle_prices.get(sym, current_price)
-        delta_30m = (
-            (current_price - prev_price) / prev_price * 100
-            if prev_price > 0 else 0.0
-        )
+        prev_price = last_cycle_prices.get(sym)
+        if current_price <= 0:
+            data_gaps.append(sym)
+            continue
+        if prev_price is None or prev_price <= 0:
+            # No prior price (first cycle, or the previous fetch failed).
+            # Rendering it as Δ=+0.00% read as "flat market" — the LLM's
+            # stated HOLD condition — and silently skipped cycles on no data.
+            delta_str = "30m Δ=n/a"
+        else:
+            delta_str = f"30m Δ={(current_price - prev_price) / prev_price * 100:+.2f}%"
         intraday_pct = data.get("change_pct", 0.0)
         lines.append(
             f"  {sym}: ${current_price:.2f}"
-            f"  30m Δ={delta_30m:+.2f}%"
+            f"  {delta_str}"
             f"  intraday={intraday_pct:+.2f}%"
         )
+    if data_gaps:
+        lines.append(f"\n== DATA GAPS (no price this cycle) ==\n  {', '.join(data_gaps)}")
 
     vix_data = market_data.get("^VIX", {})
     if vix_data:

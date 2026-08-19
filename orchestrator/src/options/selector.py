@@ -112,7 +112,7 @@ def select_csp(
         return None
 
     def _monthly_yield(row) -> float:
-        p = _mid_price(row)
+        p = _mid_price(row, "sell")
         k = float(row["strike"])
         if k <= 0:
             return 0.0
@@ -166,7 +166,7 @@ def select_csp(
         )
 
     strike = float(selected_row["strike"])
-    premium = _mid_price(selected_row)
+    premium = _mid_price(selected_row, "sell")
 
     if premium <= 0:
         logger.warning("csp_selector_zero_premium", symbol=symbol, strike=strike)
@@ -254,7 +254,7 @@ def select_cc(
         best_row = otm_calls.iloc[0]
 
     strike = float(best_row["strike"])
-    premium = _mid_price(best_row)
+    premium = _mid_price(best_row, "sell")
 
     if premium <= 0:
         logger.warning("cc_selector_zero_premium", symbol=symbol, strike=strike)
@@ -324,11 +324,29 @@ def _find_target_delta_row(
     return best_row
 
 
-def _mid_price(row: pd.Series) -> float:
-    """Return bid/ask midpoint, falling back to lastPrice."""
+HAIRCUT_FRACTION = 0.25  # of the half-spread; 1% of lastPrice when no bid/ask
+
+
+def _mid_price(row: pd.Series, side: str | None = None) -> float:
+    """Return bid/ask midpoint with an execution haircut.
+
+    side="sell": fill below mid (premium received is lower than mid);
+    side="buy":  fill above mid. side=None: raw mid (marking, not fills).
+    Booking fills at raw mid overstated every premium by half the spread.
+    """
     bid = float(row.get("bid", 0) or 0)
     ask = float(row.get("ask", 0) or 0)
     if bid > 0 and ask > 0:
-        return round((bid + ask) / 2, 2)
+        mid = (bid + ask) / 2
+        half = (ask - bid) / 2
+        if side == "sell":
+            mid -= HAIRCUT_FRACTION * half
+        elif side == "buy":
+            mid += HAIRCUT_FRACTION * half
+        return round(mid, 2)
     last = float(row.get("lastPrice", 0) or 0)
+    if side == "sell":
+        last *= 0.99
+    elif side == "buy":
+        last *= 1.01
     return round(last, 2)

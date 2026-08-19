@@ -434,7 +434,7 @@ class TestSpreadsGhostfolioAccounting:
         pos = _make_position(id=7, dte=0)  # expiration = today
         executor.update_active_positions([pos])
 
-        mock_tracker.expire_position.assert_called_once_with(7)
+        mock_tracker.expire_position.assert_called_once_with(7, costs=0.0)
         kwargs = mock_gf.create_order.call_args.kwargs
         assert kwargs["order_type"] == "BUY"  # credit position: buy back at ~0
         assert kwargs["unit_price"] == 0.01

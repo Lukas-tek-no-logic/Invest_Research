@@ -18,6 +18,20 @@ QUOTE_CACHE_TTL = 60  # seconds
 INFO_CACHE_TTL = 3600  # seconds
 
 
+def _fast_change_pct(fast: dict) -> float:
+    """Day change % from fast_info keys that actually exist.
+
+    fast_info exposes lastPrice/previousClose but not regularMarketChangePercent.
+    Returns 0.0 when previousClose is missing — same silent default as before,
+    but now only when the data truly is not there.
+    """
+    last = fast.get("lastPrice", 0) or 0
+    prev = (fast.get("previousClose", 0) or 0) or (fast.get("regularMarketPreviousClose", 0) or 0)
+    if last and prev:
+        return round((last - prev) / prev * 100, 2)
+    return 0.0
+
+
 @dataclass
 class StockQuote:
     symbol: str
@@ -77,7 +91,7 @@ class MarketDataProvider:
             quote = StockQuote(
                 symbol=symbol,
                 price=fast.get("lastPrice", 0) or 0,
-                change_pct=0,  # not exposed via fast_info reliably
+                change_pct=_fast_change_pct(fast),
                 volume=fast.get("lastVolume", 0) or 0,
                 avg_volume_10d=fast.get("tenDayAverageVolume", 0) or 0,
                 market_cap=fast.get("marketCap", 0) or 0,
@@ -239,7 +253,9 @@ class MarketDataProvider:
                 overview[sym] = {
                     "label": label,
                     "price": fast.get("lastPrice", 0),
-                    "change_pct": fast.get("regularMarketChangePercent", 0),
+                    # fast_info has no regularMarketChangePercent — the old read
+                    # reported a constant 0% for every index, VIX included.
+                    "change_pct": _fast_change_pct(fast),
                 }
             except Exception as e:
                 logger.warning("market_overview_failed", symbol=sym, error=str(e))
