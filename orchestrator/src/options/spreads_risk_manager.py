@@ -61,6 +61,11 @@ class SpreadsRiskManager:
         self.allow_same_symbol_spreads: bool = bool(
             risk_profile.get("allow_same_symbol_spreads", False)
         )
+        # VIX term-structure gate: sell premium only in contango
+        # (^VIX/^VIX3M below this ratio). Backwardation means the market is
+        # paying up for NEAR-term crash risk — exactly when short-vol premium
+        # is dear to carry. None = gate disabled.
+        self.vix_term_max_ratio: float | None = risk_profile.get("vix_term_max_ratio")
 
     def validate(
         self,
@@ -70,6 +75,7 @@ class SpreadsRiskManager:
         portfolio_greeks=None,
         market_data: dict | None = None,
         tech_signals: dict | None = None,
+        vix_term_ratio: float | None = None,
     ) -> SpreadsRiskResult:
         result = SpreadsRiskResult()
         account_value = portfolio.total_value or 1.0
@@ -117,12 +123,31 @@ class SpreadsRiskManager:
         cash_available = cash
         approved_spread_symbols: set[str] = {p.symbol for p in active_positions if p.id not in closing_ids}
 
+        # VIX term-structure gate applies to NEW premium only; closes and
+        # forced exits above are never blocked by it.
+        vix_gate_reason: str | None = None
+        if self.vix_term_max_ratio is not None:
+            if vix_term_ratio is None:
+                # Fail closed: no term-structure data = no new premium sold.
+                vix_gate_reason = "VIX term structure unavailable — not selling premium blind"
+            elif vix_term_ratio >= self.vix_term_max_ratio:
+                vix_gate_reason = (
+                    f"VIX/VIX3M {vix_term_ratio:.3f} >= {self.vix_term_max_ratio} "
+                    f"(backwardation/flat) — premium is dear to carry, skipping entries"
+                )
+
         for action in decision.actions:
             if action.type != "OPEN_SPREAD":
                 continue
 
             symbol = action.symbol
             contracts = max(1, action.contracts)
+
+            # -2. Term-structure gate (VRP accounts)
+            if vix_gate_reason is not None:
+                result.rejected_opens.append({"instruction": action, "reason": vix_gate_reason})
+                result.modifications.append(f"[REJECTED] {symbol} {action.spread_type}: {vix_gate_reason}")
+                continue
 
             # -1. Structure whitelist (VRP pilot: only index put credit spreads)
             if (self.allowed_spread_types is not None

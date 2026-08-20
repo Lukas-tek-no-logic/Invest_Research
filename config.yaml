@@ -327,6 +327,7 @@ accounts:
       target_dte_min: 30
       target_dte_max: 45
       target_delta: 0.22            # short-leg delta for the selector
+      vix_term_max_ratio: 0.95      # sell premium only in contango (^VIX/^VIX3M < 0.95); fail closed
       allowed_spread_types: ["bull_put"]   # structure whitelist — VRP only
       allow_same_symbol_spreads: true      # ladder several SPY expiries
     watchlist: ["SPY"]   # index options carry the premium; single names do not

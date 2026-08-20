@@ -425,3 +425,47 @@ class TestVrpPilotKnobs:
         ])
         result = mgr.validate(decision, [], _make_portfolio())
         assert len(result.approved_opens) == 1
+
+
+class TestVixTermGate:
+    """vix_term_max_ratio: sell premium only in contango; fail closed."""
+
+    GATED = {**RISK_PROFILE, "vix_term_max_ratio": 0.95}
+
+    def _open(self):
+        return SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY", spread_type="bull_put",
+                         contracts=1, reason="IV elevated"),
+        ])
+
+    def test_contango_passes(self):
+        mgr = SpreadsRiskManager(self.GATED)
+        result = mgr.validate(self._open(), [], _make_portfolio(), vix_term_ratio=0.88)
+        assert len(result.approved_opens) == 1
+
+    def test_backwardation_rejected(self):
+        mgr = SpreadsRiskManager(self.GATED)
+        result = mgr.validate(self._open(), [], _make_portfolio(), vix_term_ratio=1.04)
+        assert result.approved_opens == []
+        assert any("backwardation" in r["reason"] for r in result.rejected_opens)
+
+    def test_missing_ratio_fails_closed(self):
+        mgr = SpreadsRiskManager(self.GATED)
+        result = mgr.validate(self._open(), [], _make_portfolio(), vix_term_ratio=None)
+        assert result.approved_opens == []
+        assert any("unavailable" in r["reason"] for r in result.rejected_opens)
+
+    def test_closes_never_blocked_by_gate(self):
+        mgr = SpreadsRiskManager(self.GATED)
+        pos = _make_position(id=9, symbol="SPY", spread_type="BULL_PUT")
+        decision = SpreadDecision(actions=[
+            SpreadAction(type="CLOSE", symbol="SPY", spread_type="bull_put",
+                         contracts=1, reason="take profit", position_id=9),
+        ])
+        result = mgr.validate(decision, [pos], _make_portfolio(), vix_term_ratio=1.10)
+        assert len(result.approved_closes) == 1
+
+    def test_gate_absent_means_no_filtering(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        result = mgr.validate(self._open(), [], _make_portfolio(), vix_term_ratio=None)
+        assert len(result.approved_opens) == 1

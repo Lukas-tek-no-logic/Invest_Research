@@ -188,6 +188,21 @@ class Orchestrator:
         self._regime_cache = (time.time(), result)
         return result
 
+    def _vix_term_ratio(self) -> float | None:
+        """^VIX / ^VIX3M — below ~0.95 = contango (normal premium-selling
+        regime); at/above = flat or backwardation (near-term crash bid).
+        Returns None when either leg is unavailable (gate then fails closed)."""
+        try:
+            vix = self.market_data.get_current_price("^VIX")
+            vix3m = self.market_data.get_current_price("^VIX3M")
+            if vix and vix3m and vix > 0 and vix3m > 0:
+                ratio = vix / vix3m
+                logger.info("vix_term_ratio", vix=vix, vix3m=vix3m, ratio=round(ratio, 4))
+                return ratio
+        except Exception as e:
+            logger.warning("vix_term_ratio_failed", error=str(e))
+        return None
+
     def _get_spy_return_30d(self) -> float | None:
         """SPY % return over ~30 calendar days (benchmark context for the journal)."""
         if self._spy_return_cache and (time.time() - self._spy_return_cache[0]) < self._REGIME_CACHE_TTL:
@@ -1916,6 +1931,7 @@ class Orchestrator:
                 portfolio_greeks=portfolio_greeks,
                 market_data=market_data,
                 tech_signals=tech_signals,
+                vix_term_ratio=self._vix_term_ratio() if risk_profile.get("vix_term_max_ratio") else None,
             )
 
             for w in risk_result.warnings:
