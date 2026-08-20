@@ -295,28 +295,41 @@ accounts:
     watchlist: []
 
   spreads_nemotron:
-    name: "Vertical Spreads (Nemotron)"
+    name: "Vertical Spreads (Nemotron)"   # VRP PILOT since 2026-08-20 (Phase 5) — keep GF name stable
     ghostfolio_account_id: "dfb1e45f-d274-4129-bda8-010d346a5e3a"
     model: "Nemotron"
     fallback_model: "QWEN3.5"
     broker_cost_model: "ibkr"
     cron: "20 19 * * 0,4"  # Mon+Fri 19:20 CET (staggered +20min vs Qwen)
     strategy: "vertical_spreads"
-    strategy_description: "Multi-leg options spreads: iron condors, butterflies, bull/bear call/put spreads for defined-risk income"
-    prompt_style: "Select optimal spread structures based on IV skew and directional bias. Use iron condors in neutral markets, butterflies for pinning targets, bull call/bear put spreads for directional plays."
-    preferred_metrics: ["IV", "IV_Skew", "Delta", "Theta", "RSI", "Trend"]
-    horizon: "weeks (DTE 21-45)"
+    strategy_description: >-
+      VRP pilot: harvest the index variance risk premium by selling put credit
+      spreads on SPY ONLY. The premium exists because institutions structurally
+      overpay for index crash insurance; single names carry no such premium.
+      Ladder up to 4 spreads across different expiries. This is a risk premium,
+      not alpha: many small wins, rare large losses are the expected shape.
+    prompt_style: >-
+      Sell SPY put credit spreads (bull_put): short leg near 0.20-0.25 delta,
+      DTE 30-45, width $5-10. SKIP the cycle when the credit is thin (roughly
+      below a third of the width) — forcing trades in low-IV regimes hands the
+      premium back in costs. Never open directional or call-side structures.
+      Take-profit at 50% of credit and stop at 50% of max loss are enforced
+      mechanically; your job is entry timing and sizing discipline.
+    preferred_metrics: ["IV", "IV_Rank", "Delta", "Theta", "Trend"]
+    horizon: "weeks (DTE 30-45)"
     risk_profile:
-      max_open_spreads: 5
+      max_open_spreads: 4
       min_cash_pct: 20
       take_profit_pct: 50
-      stop_loss_pct: 50      # close when loss >= 50% of max_loss (was 100% = too late)
+      stop_loss_pct: 50      # close when loss >= 50% of max_loss
       min_holding_days: 5    # no mark-based TP/SL exits before day 5 (noise whipsaw); DTE/breach exits always active
       max_spread_width: 10
-      target_dte_min: 21
+      target_dte_min: 30
       target_dte_max: 45
-    # No hardcoded watchlist — uses research agent's dynamic picks
-    watchlist: []
+      target_delta: 0.22            # short-leg delta for the selector
+      allowed_spread_types: ["bull_put"]   # structure whitelist — VRP only
+      allow_same_symbol_spreads: true      # ladder several SPY expiries
+    watchlist: ["SPY"]   # index options carry the premium; single names do not
 
   moonshot:
     name: "Moonshot"

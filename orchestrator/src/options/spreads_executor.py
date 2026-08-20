@@ -146,7 +146,7 @@ class SpreadsExecutor:
             dte_min = self.risk_profile.get("target_dte_min", 21)
             dte_max = self.risk_profile.get("target_dte_max", 45)
             max_width = self.risk_profile.get("max_spread_width", 10.0)
-            target_delta = 0.30  # reasonable default for short legs
+            target_delta = float(self.risk_profile.get("target_delta", 0.30))
 
             spread = select_spread(
                 symbol=action.symbol,

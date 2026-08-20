@@ -50,6 +50,17 @@ class SpreadsRiskManager:
         # two bid-ask spreads for nothing. Structural exits (DTE, short-strike
         # breach) stay active from day one.
         self.min_holding_days: int = risk_profile.get("min_holding_days", 5)
+        # VRP-pilot knobs: restrict structures to a whitelist (e.g. ["bull_put"]
+        # for systematic index put credit spreads) and allow laddering several
+        # spreads on one underlying across expiries (a single-symbol watchlist
+        # would otherwise cap the account at one open spread).
+        allowed = risk_profile.get("allowed_spread_types")
+        self.allowed_spread_types: set[str] | None = (
+            {str(t).lower() for t in allowed} if allowed else None
+        )
+        self.allow_same_symbol_spreads: bool = bool(
+            risk_profile.get("allow_same_symbol_spreads", False)
+        )
 
     def validate(
         self,
@@ -113,8 +124,19 @@ class SpreadsRiskManager:
             symbol = action.symbol
             contracts = max(1, action.contracts)
 
+            # -1. Structure whitelist (VRP pilot: only index put credit spreads)
+            if (self.allowed_spread_types is not None
+                    and str(action.spread_type).lower() not in self.allowed_spread_types):
+                reason = (
+                    f"Spread type '{action.spread_type}' not in allowed set "
+                    f"{sorted(self.allowed_spread_types)} for this account"
+                )
+                result.rejected_opens.append({"instruction": action, "reason": reason})
+                result.modifications.append(f"[REJECTED] {symbol} {action.spread_type}: {reason}")
+                continue
+
             # 0. Duplicate check within this cycle
-            if symbol in approved_spread_symbols:
+            if symbol in approved_spread_symbols and not self.allow_same_symbol_spreads:
                 reason = f"Spread for {symbol} already open or approved this cycle — skipped"
                 result.rejected_opens.append({"instruction": action, "reason": reason})
                 result.modifications.append(f"[REJECTED] {symbol} {action.spread_type}: {reason}")

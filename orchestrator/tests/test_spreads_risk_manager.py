@@ -357,3 +357,71 @@ class TestTrendConsistencyFilter:
         result = mgr.validate(self._decision("bear_call"), [], _make_portfolio(),
                               tech_signals=None)
         assert len(result.approved_opens) == 1
+
+
+class TestVrpPilotKnobs:
+    """allowed_spread_types + allow_same_symbol_spreads (Phase 5 VRP pilot)."""
+
+    VRP_PROFILE = {
+        **RISK_PROFILE,
+        "allowed_spread_types": ["bull_put"],
+        "allow_same_symbol_spreads": True,
+    }
+
+    def test_disallowed_structure_rejected(self):
+        mgr = SpreadsRiskManager(self.VRP_PROFILE)
+        decision = SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY", spread_type="iron_condor",
+                         contracts=1, reason="neutral market"),
+        ])
+        result = mgr.validate(decision, [], _make_portfolio())
+        assert result.approved_opens == []
+        assert any("not in allowed set" in r["reason"] for r in result.rejected_opens)
+
+    def test_allowed_structure_passes(self):
+        mgr = SpreadsRiskManager(self.VRP_PROFILE)
+        decision = SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY", spread_type="bull_put",
+                         contracts=1, reason="IV rank elevated"),
+        ])
+        result = mgr.validate(decision, [], _make_portfolio())
+        assert len(result.approved_opens) == 1
+
+    def test_case_insensitive_whitelist(self):
+        mgr = SpreadsRiskManager(self.VRP_PROFILE)
+        decision = SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY", spread_type="BULL_PUT",
+                         contracts=1, reason="ok"),
+        ])
+        result = mgr.validate(decision, [], _make_portfolio())
+        assert len(result.approved_opens) == 1
+
+    def test_same_symbol_ladder_allowed(self):
+        """With the flag, a second SPY spread may open next to an existing one."""
+        mgr = SpreadsRiskManager(self.VRP_PROFILE)
+        existing = _make_position(id=1, symbol="SPY", spread_type="BULL_PUT")
+        decision = SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY", spread_type="bull_put",
+                         contracts=1, reason="ladder next expiry"),
+        ])
+        result = mgr.validate(decision, [existing], _make_portfolio())
+        assert len(result.approved_opens) == 1
+
+    def test_same_symbol_still_blocked_without_flag(self):
+        mgr = SpreadsRiskManager({**RISK_PROFILE, "allowed_spread_types": ["bull_put"]})
+        existing = _make_position(id=1, symbol="SPY", spread_type="BULL_PUT")
+        decision = SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY", spread_type="bull_put",
+                         contracts=1, reason="ladder"),
+        ])
+        result = mgr.validate(decision, [existing], _make_portfolio())
+        assert result.approved_opens == []
+
+    def test_no_whitelist_means_everything_allowed(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        decision = SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="NVDA", spread_type="iron_condor",
+                         contracts=1, reason="neutral"),
+        ])
+        result = mgr.validate(decision, [], _make_portfolio())
+        assert len(result.approved_opens) == 1
