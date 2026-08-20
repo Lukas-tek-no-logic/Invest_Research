@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 import structlog
 
 from ..portfolio_state import PortfolioState, Position
+from ..transaction_costs import calculate_cost
 
 logger = structlog.get_logger()
 
@@ -37,10 +38,21 @@ class SimTrade:
 class SimulatedPortfolio:
     """In-memory portfolio that tracks cash, positions, and trade history."""
 
-    def __init__(self, initial_cash: float = 10_000):
+    def __init__(self, initial_cash: float = 10_000, broker_cost_model: str = ""):
         self.cash = initial_cash
         self.initial_cash = initial_cash
         self.positions: dict[str, SimPosition] = {}
+        # "" = frictionless (legacy behaviour). With a model set, every fill
+        # pays the same commission the live executor books — a backtest that
+        # ignores costs rewards churn, which is exactly the failure mode the
+        # OOS run measured (179 vs 114 trades decided the model gap).
+        self.broker_cost_model = broker_cost_model
+        self.fees_paid = 0.0
+
+    def _fee(self, quantity: float, price: float) -> float:
+        if not self.broker_cost_model:
+            return 0.0
+        return calculate_cost(self.broker_cost_model, quantity, price)
 
     def buy(
         self,
@@ -55,8 +67,9 @@ class SimulatedPortfolio:
                             quantity=0, price=price, total=0, success=False,
                             error="Invalid price")
 
-        # Clamp to available cash
-        amount_usd = min(amount_usd, self.cash)
+        # Clamp to available cash (leave room for the commission)
+        fee_headroom = 1.0 if self.broker_cost_model else 0.0
+        amount_usd = min(amount_usd, self.cash - fee_headroom)
         if amount_usd <= 0:
             return SimTrade(date=sim_date, symbol=symbol, type="BUY",
                             quantity=0, price=price, total=0, success=False,
@@ -78,8 +91,10 @@ class SimulatedPortfolio:
                 buy_date=sim_date,
             )
 
-        self.cash -= total
-        logger.debug("sim_buy", symbol=symbol, qty=quantity, price=price, total=total)
+        fee = self._fee(quantity, price)
+        self.cash -= total + fee
+        self.fees_paid += fee
+        logger.debug("sim_buy", symbol=symbol, qty=quantity, price=price, total=total, fee=fee)
         return SimTrade(date=sim_date, symbol=symbol, type="BUY",
                         quantity=quantity, price=price, total=total, success=True)
 
@@ -113,8 +128,10 @@ class SimulatedPortfolio:
         if pos.quantity <= 0.0001:
             del self.positions[symbol]
 
-        self.cash += total
-        logger.debug("sim_sell", symbol=symbol, qty=quantity, price=price, total=total)
+        fee = self._fee(quantity, price)
+        self.cash += total - fee
+        self.fees_paid += fee
+        logger.debug("sim_sell", symbol=symbol, qty=quantity, price=price, total=total, fee=fee)
         return SimTrade(date=sim_date, symbol=symbol, type="SELL",
                         quantity=quantity, price=price, total=total,
                         success=True, avg_cost=avg_cost)

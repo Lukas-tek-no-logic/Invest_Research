@@ -105,7 +105,10 @@ def run_backtest(
         if spy_at_start > 0 else 0.0
     )
 
-    sim_portfolio = SimulatedPortfolio(initial_cash)
+    sim_portfolio = SimulatedPortfolio(
+        initial_cash,
+        broker_cost_model=account_config.get("broker_cost_model", ""),
+    )
     snapshots: list[dict] = []
     trades: list[SimTrade] = []
     decisions: list[dict] = []
