@@ -469,3 +469,45 @@ class TestVixTermGate:
         mgr = SpreadsRiskManager(RISK_PROFILE)
         result = mgr.validate(self._open(), [], _make_portfolio(), vix_term_ratio=None)
         assert len(result.approved_opens) == 1
+
+
+class TestEwmaSizing:
+    """ewma_sizing: scale new-spread contracts ~ 1/EWMA_variance of SPY."""
+
+    SIZED = {**RISK_PROFILE, "ewma_sizing": {"sigma_ref": 15.0, "max_contracts": 2}}
+
+    def _open(self, contracts=2):
+        return SpreadDecision(actions=[
+            SpreadAction(type="OPEN_SPREAD", symbol="SPY", spread_type="bull_put",
+                         contracts=contracts, reason="IV elevated"),
+        ])
+
+    def test_low_vol_keeps_max_contracts(self):
+        # sigma 10 < ref 15: floor(2 * (15/10)^2) = 4, capped at max_contracts=2
+        mgr = SpreadsRiskManager(self.SIZED)
+        result = mgr.validate(self._open(contracts=2), [], _make_portfolio(), ewma_sigma=10.0)
+        assert len(result.approved_opens) == 1
+        assert result.approved_opens[0].contracts == 2
+        assert not any("[SIZED]" in m for m in result.modifications)
+
+    def test_high_vol_trims_to_one(self):
+        # sigma 30 >> ref 15: floor(2 * (15/30)^2) = 0 -> floored at 1
+        mgr = SpreadsRiskManager(self.SIZED)
+        result = mgr.validate(self._open(contracts=2), [], _make_portfolio(), ewma_sigma=30.0)
+        assert len(result.approved_opens) == 1
+        assert result.approved_opens[0].contracts == 1
+        assert any("[SIZED]" in m for m in result.modifications)
+
+    def test_missing_sigma_fails_safe_to_one(self):
+        mgr = SpreadsRiskManager(self.SIZED)
+        result = mgr.validate(self._open(contracts=2), [], _make_portfolio(), ewma_sigma=None)
+        assert len(result.approved_opens) == 1
+        assert result.approved_opens[0].contracts == 1
+        assert any("[SIZED]" in m and "fail-safe" in m for m in result.modifications)
+
+    def test_block_absent_means_no_sizing(self):
+        mgr = SpreadsRiskManager(RISK_PROFILE)
+        result = mgr.validate(self._open(contracts=2), [], _make_portfolio(), ewma_sigma=40.0)
+        assert len(result.approved_opens) == 1
+        assert result.approved_opens[0].contracts == 2
+        assert not any("[SIZED]" in m for m in result.modifications)

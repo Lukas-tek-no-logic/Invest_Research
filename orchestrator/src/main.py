@@ -203,6 +203,28 @@ class Orchestrator:
             logger.warning("vix_term_ratio_failed", error=str(e))
         return None
 
+    def _spy_ewma_sigma(self) -> float | None:
+        """Annualized EWMA volatility of SPY daily log returns (lambda=0.94),
+        in % per year. Feeds the VRP pilot's contract sizing (notional ~
+        1/EWMA_var). Returns None on any data failure (sizing then fails safe
+        to 1 contract)."""
+        try:
+            import numpy as np
+
+            df = self.market_data.get_history("SPY", period="1y")
+            closes = df["Close"]
+            log_ret = np.log(closes / closes.shift(1)).dropna()
+            if len(log_ret) < 30:
+                logger.warning("spy_ewma_sigma_failed", error="not enough history")
+                return None
+            ewma_var = (log_ret ** 2).ewm(alpha=1 - 0.94).mean()
+            sigma = float(ewma_var.iloc[-1]) ** 0.5 * (252 ** 0.5) * 100
+            logger.info("spy_ewma_sigma", sigma=round(sigma, 2))
+            return sigma
+        except Exception as e:
+            logger.warning("spy_ewma_sigma_failed", error=str(e))
+            return None
+
     def _get_spy_return_30d(self) -> float | None:
         """SPY % return over ~30 calendar days (benchmark context for the journal)."""
         if self._spy_return_cache and (time.time() - self._spy_return_cache[0]) < self._REGIME_CACHE_TTL:
@@ -1932,6 +1954,7 @@ class Orchestrator:
                 market_data=market_data,
                 tech_signals=tech_signals,
                 vix_term_ratio=self._vix_term_ratio() if risk_profile.get("vix_term_max_ratio") else None,
+                ewma_sigma=self._spy_ewma_sigma() if risk_profile.get("ewma_sizing") else None,
             )
 
             for w in risk_result.warnings:

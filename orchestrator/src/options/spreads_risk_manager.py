@@ -8,6 +8,7 @@ Produces a SpreadsRiskResult consumed by main.py's run_spreads_cycle().
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -66,6 +67,16 @@ class SpreadsRiskManager:
         # paying up for NEAR-term crash risk — exactly when short-vol premium
         # is dear to carry. None = gate disabled.
         self.vix_term_max_ratio: float | None = risk_profile.get("vix_term_max_ratio")
+        # EWMA volatility sizing (VRP pilot): scale the notional of NEW spreads
+        # ~ 1/EWMA_variance of SPY so the account sells less premium when
+        # realized vol is high (2005-2026 backtest: Sharpe proxy 0.29 -> 1.04).
+        # Optional block; absent = sizing disabled, behaviour unchanged.
+        ewma_cfg = risk_profile.get("ewma_sizing")
+        self.ewma_sizing_enabled: bool = ewma_cfg is not None
+        ewma_cfg = ewma_cfg or {}
+        self.ewma_sigma_ref: float = float(ewma_cfg.get("sigma_ref", 15.0))
+        self.ewma_max_contracts: int = int(ewma_cfg.get("max_contracts", 2))
+        self.ewma_lambda: float = float(ewma_cfg.get("lambda", 0.94))
 
     def validate(
         self,
@@ -76,6 +87,7 @@ class SpreadsRiskManager:
         market_data: dict | None = None,
         tech_signals: dict | None = None,
         vix_term_ratio: float | None = None,
+        ewma_sigma: float | None = None,
     ) -> SpreadsRiskResult:
         result = SpreadsRiskResult()
         account_value = portfolio.total_value or 1.0
@@ -136,12 +148,39 @@ class SpreadsRiskManager:
                     f"(backwardation/flat) — premium is dear to carry, skipping entries"
                 )
 
+        # EWMA vol sizing for NEW spreads: contracts allowed shrink ~ 1/sigma^2.
+        # Fail-safe: block configured but no sigma available -> size to 1.
+        ewma_allowed: int | None = None
+        ewma_note: str = ""
+        if self.ewma_sizing_enabled:
+            if ewma_sigma is None:
+                ewma_allowed = 1
+                ewma_note = "EWMA sigma unavailable — fail-safe sizing to 1 contract"
+            else:
+                raw = math.floor(
+                    self.ewma_max_contracts * (self.ewma_sigma_ref / ewma_sigma) ** 2
+                )
+                ewma_allowed = max(1, min(self.ewma_max_contracts, raw))
+                ewma_note = (
+                    f"EWMA sigma {ewma_sigma:.1f}% vs ref {self.ewma_sigma_ref:.1f}% "
+                    f"— allowed {ewma_allowed} contract(s)"
+                )
+
         for action in decision.actions:
             if action.type != "OPEN_SPREAD":
                 continue
 
             symbol = action.symbol
             contracts = max(1, action.contracts)
+
+            # -3. EWMA volatility sizing (VRP accounts)
+            if ewma_allowed is not None and contracts > ewma_allowed:
+                result.modifications.append(
+                    f"[SIZED] {symbol} {action.spread_type}: contracts "
+                    f"{contracts} -> {ewma_allowed} ({ewma_note})"
+                )
+                action.contracts = ewma_allowed
+                contracts = ewma_allowed
 
             # -2. Term-structure gate (VRP accounts)
             if vix_gate_reason is not None:
